@@ -1482,6 +1482,104 @@ do -- visuals
     local FovChanger = false;
     local TpDistance = 15
     
+
+-- ==========================================
+-- ADVANCED TEAM CHECK
+-- VISUALS TAB
+-- ==========================================
+
+local AdvancedTeamCheck = {
+    Enabled = true,
+    IgnoreSameTeam = true,
+    IgnoreNeutral = true,
+    IgnoreDead = true
+}
+
+-- Player eligibility filter
+function AdvancedTeamCheck:IsAllowed(player)
+
+    if not player or player == LocalPlayer then
+        return false
+    end
+
+    if not self.Enabled then
+        return true
+    end
+
+    if self.IgnoreSameTeam
+        and LocalPlayer.Team ~= nil
+        and player.Team == LocalPlayer.Team then
+
+        return false
+    end
+
+    if self.IgnoreNeutral and player.Neutral then
+        return false
+    end
+
+    local character = player.Character
+
+    if not character then
+        return false
+    end
+
+    if self.IgnoreDead then
+        local humanoid =
+            character:FindFirstChildOfClass("Humanoid")
+
+        if not humanoid or humanoid.Health <= 0 then
+            return false
+        end
+    end
+
+    return true
+end
+
+-- ==========================================
+-- GUI
+-- ==========================================
+
+Sections.visuals:Toggle({
+    Name = "Advanced Team Check",
+    Flag = "advancedteamcheck",
+    Default = true,
+
+    Callback = function(value)
+        AdvancedTeamCheck.Enabled = value
+    end
+})
+
+Sections.visuals:Toggle({
+    Name = "Ignore Same Team",
+    Flag = "atc_sameteam",
+    Default = true,
+
+    Callback = function(value)
+        AdvancedTeamCheck.IgnoreSameTeam = value
+    end
+})
+
+Sections.visuals:Toggle({
+    Name = "Ignore Neutral",
+    Flag = "atc_neutral",
+    Default = true,
+
+    Callback = function(value)
+        AdvancedTeamCheck.IgnoreNeutral = value
+    end
+})
+
+Sections.visuals:Toggle({
+    Name = "Ignore Dead Players",
+    Flag = "atc_dead",
+    Default = true,
+
+    Callback = function(value)
+        AdvancedTeamCheck.IgnoreDead = value
+    end
+})
+
+
 -- ==========================================
 -- MOVEMENT RESOLVER / PLAYER MONITOR
 -- VISUALS TAB
