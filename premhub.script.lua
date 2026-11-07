@@ -2095,6 +2095,377 @@ Sections.visuals:Toggle({
     --#endregion
 
 
+-- Equipped-tool chams. Controls live on the visuals tab.
+local ToolChams = {
+    Enabled = false,
+    Glow = true,
+    XRay = true,
+    Rainbow = false,
+    RainbowSpeed = 0.2,
+    Color = Color3.fromHSV(0.53, 1, 1),
+    FillTransparency = 0.15,
+    PartTransparency = 0,
+    OutlineTransparency = 0,
+    Material = "Neon",
+}
+
+local ToolChamsMaterials = { "Neon", "ForceField", "Glass", "Solid" }
+local ToolChamsMaterialEnums = {
+    Neon = Enum.Material.Neon,
+    ForceField = Enum.Material.ForceField,
+    Glass = Enum.Material.Glass,
+    Solid = Enum.Material.SmoothPlastic,
+}
+
+local ToolChamsTool
+local ToolChamsHighlight
+local ToolChamsOriginals = {}
+local ToolChamsTracked = {}
+local ToolChamsCharacterConns = {}
+local ToolChamsToolConns = {}
+
+local ToolChamsGui = Instance.new("ScreenGui")
+ToolChamsGui.Name = "ToolChams"
+ToolChamsGui.ResetOnSpawn = false
+ToolChamsGui.Enabled = true
+ToolChamsGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+local function ToolChamsDisconnect(list)
+    for _, connection in ipairs(list) do
+        connection:Disconnect()
+    end
+    table.clear(list)
+end
+
+local function ToolChamsSave(object)
+    if ToolChamsOriginals[object] then
+        return
+    end
+
+    if object:IsA("BasePart") then
+        local saved = {
+            Kind = "Part",
+            Color = object.Color,
+            Transparency = object.Transparency,
+            Material = object.Material,
+        }
+
+        if object:IsA("MeshPart") then
+            saved.TextureID = object.TextureID
+        end
+
+        ToolChamsOriginals[object] = saved
+    elseif object:IsA("SpecialMesh") then
+        ToolChamsOriginals[object] = {
+            Kind = "Mesh",
+            TextureId = object.TextureId,
+        }
+    elseif object:IsA("Decal") or object:IsA("Texture") then
+        ToolChamsOriginals[object] = {
+            Kind = "Decal",
+            Transparency = object.Transparency,
+        }
+    end
+end
+
+local function ToolChamsPaint(object)
+    if object:IsA("BasePart") then
+        object.Color = ToolChams.Color
+        object.Transparency = ToolChams.PartTransparency
+        object.Material = ToolChamsMaterialEnums[ToolChams.Material] or Enum.Material.Neon
+
+        if object:IsA("MeshPart") then
+            object.TextureID = ""
+        end
+    elseif object:IsA("SpecialMesh") then
+        object.TextureId = ""
+    elseif object:IsA("Decal") or object:IsA("Texture") then
+        object.Transparency = 1
+    end
+end
+
+local function ToolChamsRestore()
+    if ToolChamsHighlight then
+        ToolChamsHighlight:Destroy()
+        ToolChamsHighlight = nil
+    end
+
+    ToolChamsDisconnect(ToolChamsToolConns)
+
+    for object, saved in pairs(ToolChamsOriginals) do
+        if object.Parent then
+            if saved.Kind == "Part" then
+                object.Color = saved.Color
+                object.Transparency = saved.Transparency
+                object.Material = saved.Material
+
+                if saved.TextureID ~= nil and object:IsA("MeshPart") then
+                    object.TextureID = saved.TextureID
+                end
+            elseif saved.Kind == "Mesh" and object:IsA("SpecialMesh") then
+                object.TextureId = saved.TextureId
+            elseif saved.Kind == "Decal" then
+                object.Transparency = saved.Transparency
+            end
+        end
+    end
+
+    table.clear(ToolChamsOriginals)
+    table.clear(ToolChamsTracked)
+    ToolChamsTool = nil
+end
+
+local function ToolChamsIsVisual(object)
+    return object:IsA("BasePart")
+        or object:IsA("SpecialMesh")
+        or object:IsA("Decal")
+        or object:IsA("Texture")
+end
+
+local function ToolChamsTrack(object)
+    if not ToolChamsIsVisual(object) then
+        return
+    end
+
+    if ToolChamsTracked[object] then
+        ToolChamsPaint(object)
+        return
+    end
+
+    ToolChamsSave(object)
+    ToolChamsTracked[object] = true
+    ToolChamsPaint(object)
+end
+
+local function ToolChamsUpdate()
+    if ToolChamsHighlight then
+        ToolChamsHighlight.Enabled = ToolChams.Glow
+        ToolChamsHighlight.FillColor = ToolChams.Color
+        ToolChamsHighlight.OutlineColor = ToolChams.Color
+        ToolChamsHighlight.FillTransparency = ToolChams.FillTransparency
+        ToolChamsHighlight.OutlineTransparency = ToolChams.OutlineTransparency
+        ToolChamsHighlight.DepthMode = ToolChams.XRay
+            and Enum.HighlightDepthMode.AlwaysOnTop
+            or Enum.HighlightDepthMode.Occluded
+    end
+
+    if not ToolChams.Enabled then
+        return
+    end
+
+    for object in pairs(ToolChamsTracked) do
+        if object.Parent then
+            ToolChamsPaint(object)
+        else
+            ToolChamsTracked[object] = nil
+            ToolChamsOriginals[object] = nil
+        end
+    end
+end
+
+local function ToolChamsBind(tool)
+    ToolChamsDisconnect(ToolChamsToolConns)
+
+    table.insert(ToolChamsToolConns, tool.DescendantAdded:Connect(function(object)
+        if ToolChams.Enabled then
+            ToolChamsTrack(object)
+        end
+    end))
+
+    table.insert(ToolChamsToolConns, tool.DescendantRemoving:Connect(function(object)
+        ToolChamsTracked[object] = nil
+        ToolChamsOriginals[object] = nil
+    end))
+
+    for _, object in tool:GetDescendants() do
+        ToolChamsTrack(object)
+    end
+end
+
+local function ToolChamsGetEquipped()
+    local character = LocalPlayer.Character
+    if not character then
+        return nil
+    end
+
+    for _, object in character:GetChildren() do
+        if object:IsA("Tool") then
+            return object
+        end
+    end
+
+    return nil
+end
+
+local function ApplyToolChams()
+    local tool = ToolChamsGetEquipped()
+
+    if not ToolChams.Enabled or not tool then
+        ToolChamsRestore()
+        return
+    end
+
+    if tool ~= ToolChamsTool then
+        ToolChamsRestore()
+        ToolChamsTool = tool
+
+        ToolChamsHighlight = Instance.new("Highlight")
+        ToolChamsHighlight.Name = "ToolChams"
+        ToolChamsHighlight.Adornee = tool
+        ToolChamsHighlight.Parent = ToolChamsGui
+        ToolChamsBind(tool)
+    end
+
+    ToolChamsUpdate()
+end
+
+local function ToolChamsWatch(character)
+    ToolChamsDisconnect(ToolChamsCharacterConns)
+    ToolChamsRestore()
+
+    table.insert(ToolChamsCharacterConns, character.ChildAdded:Connect(function(child)
+        if child:IsA("Tool") then
+            task.defer(ApplyToolChams)
+        end
+    end))
+
+    table.insert(ToolChamsCharacterConns, character.ChildRemoved:Connect(function(child)
+        if child == ToolChamsTool or child:IsA("Tool") then
+            task.defer(ApplyToolChams)
+        end
+    end))
+
+    task.defer(ApplyToolChams)
+end
+
+LocalPlayer.CharacterAdded:Connect(ToolChamsWatch)
+if LocalPlayer.Character then
+    ToolChamsWatch(LocalPlayer.Character)
+end
+
+RunService.RenderStepped:Connect(function(dt)
+    if ToolChams.Rainbow and ToolChams.Enabled then
+        local hue, saturation, brightness = ToolChams.Color:ToHSV()
+        ToolChams.Color = Color3.fromHSV((hue + dt * ToolChams.RainbowSpeed) % 1, saturation, brightness)
+        ToolChamsUpdate()
+    end
+end)
+
+Sections.visuals:Toggle({
+    Name = "tool chams",
+    Flag = "toolchams",
+    Default = false,
+    Callback = function(value)
+        ToolChams.Enabled = value
+        ApplyToolChams()
+    end
+})
+
+Sections.visuals:Label({
+    Name = "tool chams color"
+}):Colorpicker({
+    Name = "tool chams color",
+    Flag = "toolchamscolor",
+    Default = ToolChams.Color,
+    Callback = function(value)
+        ToolChams.Color = value
+        ToolChamsUpdate()
+    end
+})
+
+Sections.visuals:Slider({
+    Name = "tool fill transparency",
+    Flag = "toolchamsfill",
+    Min = 0,
+    Max = 1,
+    Default = ToolChams.FillTransparency,
+    Decimals = 0.01,
+    Callback = function(value)
+        ToolChams.FillTransparency = value
+        ToolChamsUpdate()
+    end
+})
+
+Sections.visuals:Slider({
+    Name = "tool part transparency",
+    Flag = "toolchamspart",
+    Min = 0,
+    Max = 1,
+    Default = ToolChams.PartTransparency,
+    Decimals = 0.01,
+    Callback = function(value)
+        ToolChams.PartTransparency = value
+        ToolChamsUpdate()
+    end
+})
+
+Sections.visuals:Slider({
+    Name = "tool outline transparency",
+    Flag = "toolchamsoutline",
+    Min = 0,
+    Max = 1,
+    Default = ToolChams.OutlineTransparency,
+    Decimals = 0.01,
+    Callback = function(value)
+        ToolChams.OutlineTransparency = value
+        ToolChamsUpdate()
+    end
+})
+
+Sections.visuals:Toggle({
+    Name = "tool chams glow",
+    Flag = "toolchamsglow",
+    Default = true,
+    Callback = function(value)
+        ToolChams.Glow = value
+        ToolChamsUpdate()
+    end
+})
+
+Sections.visuals:Toggle({
+    Name = "tool chams x-ray",
+    Flag = "toolchamsxray",
+    Default = true,
+    Callback = function(value)
+        ToolChams.XRay = value
+        ToolChamsUpdate()
+    end
+})
+
+Sections.visuals:Dropdown({
+    Name = "tool chams material",
+    Flag = "toolchamsmaterial",
+    Items = ToolChamsMaterials,
+    Default = "Neon",
+    Callback = function(value)
+        if ToolChamsMaterialEnums[value] then
+            ToolChams.Material = value
+            ToolChamsUpdate()
+        end
+    end
+})
+
+Sections.visuals:Toggle({
+    Name = "tool chams rainbow",
+    Flag = "toolchamsrainbow",
+    Default = false,
+    Callback = function(value)
+        ToolChams.Rainbow = value
+    end
+})
+
+Sections.visuals:Slider({
+    Name = "tool chams rainbow speed",
+    Flag = "toolchamsrainbowspeed",
+    Min = 0.05,
+    Max = 1,
+    Default = ToolChams.RainbowSpeed,
+    Decimals = 0.01,
+    Callback = function(value)
+        ToolChams.RainbowSpeed = value
+    end
+})
+
 
     --#region toggles
 
