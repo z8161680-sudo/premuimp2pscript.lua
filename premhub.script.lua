@@ -283,12 +283,148 @@
 
 
 
+-- Shared team policy for aim, ESP and chams. Unknown teams fall back to
+-- same-team exclusion instead of guessing their role.
+local CurrentTargetPlayer, CurrentTargetTime = nil, 0
+local ResolverSnapshot = nil
+local ResolverRunning = false
+local function ReportTarget(part)
+    local model = part and part:FindFirstAncestorOfClass("Model")
+    local plr = model and Players:GetPlayerFromCharacter(model)
+    if plr then CurrentTargetPlayer, CurrentTargetTime = plr, os.clock() end
+end
+
+local PriorityTeamCheck = true
+local function TeamRole(player)
+    local name = player.Team and string.lower(player.Team.Name) or ""
+    if name:find("guard", 1, true) or name:find("police", 1, true) then return "police" end
+    if name:find("crim", 1, true) then return "criminal" end
+    if name:find("inmate", 1, true) or name:find("prisoner", 1, true) then return "prisoner" end
+    return "unknown"
+end
+local function TargetPriority(player)
+    if not player or player == LocalPlayer then return nil end
+    if not PriorityTeamCheck then return 1 end
+    local localRole, role = TeamRole(LocalPlayer), TeamRole(player)
+    if localRole == "police" then
+        if role == "criminal" then return 1 end
+        if role == "prisoner" then return 2 end
+        return nil
+    elseif localRole == "criminal" then
+        if role == "police" then return 1 end
+        return nil
+    elseif localRole == "prisoner" then
+        if role == "police" then return 1 end
+        if role == "criminal" then return 2 end
+        return nil
+    end
+    if LocalPlayer.Team and LocalPlayer.Team == player.Team then return nil end
+    return 1
+end
+
+local function AAOffset()
+    local env = (type(getgenv) == "function" and getgenv()) or _G
+    if type(env.AdvancedAAOffset) == "function" then
+        local ok, value = pcall(env.AdvancedAAOffset)
+        if ok and typeof(value) == "Vector3" then return value end
+    end
+    return Vector3.zero
+end
+
+local function PauseAAForAction(seconds)
+    local env = (type(getgenv) == "function" and getgenv()) or _G
+    if type(env.AdvancedAAPause) == "function" then
+        env.AdvancedAAPause(seconds or 0.2)
+    end
+end
+
+
+-- Target panel. Resolver labels describe heuristics, not proof of cheating.
+do
+    local old = LocalPlayer.PlayerGui:FindFirstChild("TargetingPanel")
+    if old then old:Destroy() end
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "TargetingPanel"
+    gui.ResetOnSpawn = false
+    gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+    local box = Instance.new("Frame")
+    box.Size = UDim2.fromOffset(280, 108)
+    box.Position = UDim2.new(0.5, -140, 0.7, 0)
+    box.BackgroundColor3 = Color3.fromRGB(18, 20, 27)
+    box.BorderSizePixel = 0
+    box.Visible = false
+    box.Active = true
+    box.Draggable = true
+    box.Parent = gui
+    local corner = Instance.new("UICorner", box)
+    corner.CornerRadius = UDim.new(0, 7)
+    local stroke = Instance.new("UIStroke", box)
+    stroke.Color = Color3.fromRGB(65, 135, 210)
+    local header = Instance.new("TextLabel", box)
+    header.Size = UDim2.new(1, 0, 0, 25)
+    header.BackgroundColor3 = Color3.fromRGB(27, 39, 57)
+    header.BorderSizePixel = 0
+    header.Font = Enum.Font.GothamBold
+    header.TextSize = 12
+    header.TextColor3 = Color3.fromRGB(130, 195, 255)
+    header.Text = "TARGETING"
+    local avatar = Instance.new("ImageLabel", box)
+    avatar.Position = UDim2.fromOffset(8, 32)
+    avatar.Size = UDim2.fromOffset(67, 67)
+    avatar.BackgroundColor3 = Color3.fromRGB(31, 35, 45)
+    local detail = Instance.new("TextLabel", box)
+    detail.Position = UDim2.fromOffset(84, 30)
+    detail.Size = UDim2.new(1, -90, 0, 73)
+    detail.BackgroundTransparency = 1
+    detail.Font = Enum.Font.Gotham
+    detail.TextSize = 12
+    detail.TextColor3 = Color3.fromRGB(225, 230, 240)
+    detail.TextXAlignment = Enum.TextXAlignment.Left
+    detail.TextYAlignment = Enum.TextYAlignment.Top
+    local shown, lastAvatar = true, nil
+    Sections.aimbot:Toggle({
+        Name = "targeting panel", Flag = "targetingpanel", Default = true,
+        Callback = function(value) shown = value end,
+    })
+    RunService.RenderStepped:Connect(function()
+        local p = CurrentTargetPlayer
+        local c = p and p.Character
+        local h = c and c:FindFirstChildOfClass("Humanoid")
+        local r = c and c:FindFirstChild("HumanoidRootPart")
+        local own = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        local active = p and p.Parent == Players and h and h.Health > 0 and r and own
+            and os.clock() - CurrentTargetTime < 1
+        box.Visible = shown and not not active
+        if not active then return end
+        local status = ResolverRunning and "Unknown (no sample)" or "Unknown (resolver off)"
+        local data = ResolverSnapshot and ResolverSnapshot[p]
+        if ResolverRunning and data and data.LastPosition then
+            status = data.Flagged and "Dangerous (flagged)" or "Safe (not flagged)"
+        end
+        detail.Text = string.format("%s (@%s)\nHealth: %.0f / %.0f\nDistance: %.0f studs\n%s",
+            p.DisplayName, p.Name, h.Health, h.MaxHealth, (r.Position - (own.Position - AAOffset())).Magnitude, status)
+        if lastAvatar ~= p.UserId then
+            local id = p.UserId
+            lastAvatar = id
+            avatar.Image = ""
+            task.spawn(function()
+                local ok, content = pcall(function()
+                    return Players:GetUserThumbnailAsync(id, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size100x100)
+                end)
+                if ok and lastAvatar == id and avatar.Parent then avatar.Image = content end
+            end)
+        end
+    end)
+end
+
 do -- combat
     local SilentAimEnabled = false; 
     local NoSpreadEnabled = false;
     local ManipEnabled = false;
-    local Manips = 5;
-    local ManipStep = 0.25;
+    local Manips = 2;
+    local ManipScanCount = 120;
+    local ScanProgress = 0;
+    local ScanStatus = "idle";
     local NoRecoilEnabled = false;
     local RageBotEnabled = false;
     local SilentReload = false;
@@ -300,6 +436,9 @@ do -- combat
     local NoSpread = false;
     local RagebotTarget = nil 
     local SilentAimTarget = nil 
+
+    local autofireparams = RaycastParams.new()
+    autofireparams.FilterType = Enum.RaycastFilterType.Exclude
 
     --#region tracers
 
@@ -358,54 +497,57 @@ do -- combat
         local cachedoffset = nil
         --local lastShotTarget = nil
 
-        local autofireparams = RaycastParams.new()
-        autofireparams.FilterType = Enum.RaycastFilterType.Blacklist
         autofireparams.FilterDescendantsInstances = {LocalPlayer.Character}
 
         LocalPlayer.CharacterAdded:Connect(function(char)
             autofireparams.FilterDescendantsInstances = {char}
         end)
 
+        -- Fixed raycast budget; samples points throughout a sphere, including
+        -- near and far offsets. A wider range does not override server checks.
         function findminoffset(target, origin, ignorezeropos)
-            local maxdist = Manips
-            local step = ManipStep
-
-            if target then 
-                local aimpos = target.Position
-                local disttotarget = (aimpos - origin).Magnitude -- change so not ziro
-
-                local centerdir = (aimpos - origin).Unit
-                local centerresult = workspace:Raycast(origin, centerdir * disttotarget, autofireparams)
-
-                if centerresult and centerresult.Instance and not ignorezeropos then
-                    if centerresult.Instance:IsDescendantOf(target.Parent) then
-                        return Vector3.zero, false, centerresult.Instance
-                    end
+            if not target or not target.Parent then return nil, false, nil end
+            autofireparams.FilterDescendantsInstances = {LocalPlayer.Character}
+            local function test(offset)
+                if not target.Parent then return nil end
+                -- Reject origins reached through a wall. This is only a
+                -- conservative local check, not a server validation guarantee.
+                if offset.Magnitude > 0.001
+                    and workspace:Raycast(origin, offset, autofireparams) then
+                    return nil
                 end
-
-                local step = 0.25
-                local dist = step
-            
-                while dist <= Manips do
-                    for i, v in cheatinfo.manip_corners do
-                        if v == Vector3.zero then continue end
-
-                        local newoffset = v * dist
-                        local neworigin = origin + newoffset
-                        local dir = (aimpos - neworigin).Unit
-                        local result = workspace:Raycast(neworigin, dir * disttotarget, autofireparams)
-
-                        if result and result.Instance then
-                            if result.Instance:IsDescendantOf(target.Parent) then
-                                return newoffset, i ~= 1, result.Instance
-                            end
-                        end
-                    end
-                    dist += step
+                local start = origin + offset
+                local direction = target.Position - start
+                if direction.Magnitude < 0.001 then return nil end
+                local hit = workspace:Raycast(start, direction, autofireparams)
+                if hit and hit.Instance and hit.Instance:IsDescendantOf(target.Parent) then
+                    return hit.Instance
                 end
-
-                return nil, false, nil
             end
+            ScanProgress, ScanStatus = 0, "scanning"
+            if not ignorezeropos then
+                local hit = test(Vector3.zero)
+                if hit then ScanProgress, ScanStatus = 1, "direct"; return Vector3.zero, false, hit end
+            end
+            local count = math.clamp(math.floor(ManipScanCount), 1, 500)
+            local bestOffset, bestHit, bestLength = nil, nil, math.huge
+            local golden = math.pi * (3 - math.sqrt(5))
+            for i = 1, count do
+                local y = 1 - 2 * ((i - 0.5) / count)
+                local radial = math.sqrt(math.max(0, 1 - y * y))
+                local angle = i * golden
+                -- Interleave distances so small and large offsets are both tested.
+                local fraction = (((i * 37) % count) + 1) / count
+                local length = Manips * fraction
+                local offset = Vector3.new(math.cos(angle) * radial, y, math.sin(angle) * radial) * length
+                local hit = test(offset)
+                if hit and length < bestLength then
+                    bestOffset, bestHit, bestLength = offset, hit, length
+                end
+                ScanProgress = i / count
+            end
+            ScanStatus = bestOffset and "found" or "no path"
+            return bestOffset, bestOffset ~= nil, bestHit
         end
 
     --#endregion
@@ -427,62 +569,28 @@ do -- combat
         end))
 
         function GetTarget()
-            local MouseLocation = UserInputService.GetMouseLocation(UserInputService)
-            local FinalPart, Distance = nil, math.huge
-
-                for _, plr in Players.GetPlayers(Players) do
-                    if plr == LocalPlayer then 
-                        continue 
-                    end;
-                    if plr.Team == LocalPlayer.Team then
-                        continue 
-                    end
-
-                    local Data = plr.Character
-
-                    if not Data then 
-                        continue 
-                    end;
-
-                    local AimPart = Data.FindFirstChild(Data, "Head") --Data:FindFirstChild("Head")
-                    if not AimPart then
-                        continue
-                    end;
-
-                    local Humanoid = Data.FindFirstChild(Data, "Humanoid")--Data:FindFirstChild('Humanoid')
-
-                    if not Humanoid or Humanoid.Health <= 0 then 
-                        continue 
-                    end 
-
-                    local ScreenPos, OnScreen = Camera.WorldToViewportPoint(Camera, AimPart.Position) --Camera:WorldToViewportPoint(AimPart.Position)
-                    if not OnScreen then
-                        continue
-                    end;
-
-                    local Dist = (Vector2.new(ScreenPos.X, ScreenPos.Y) - MouseLocation).Magnitude
-                    
-                    if FovCircleEnabled then
-                        local deg = math.clamp(FovCircle.Radius or 90, 0.5, 179.5)
-                        
-                        local r = math.tan(math.rad(deg / 2)) / math.tan(math.rad(Camera.FieldOfView / 2)) * (Camera.ViewportSize.Y / 2)
-
-                        if Dist > r then 
-                            continue 
-                        end
-                    end
-
-
-                    local vp = Camera.ViewportSize
-                    
-                    if Distance < Dist then
-                        continue
-                    end;
-                    Distance = Dist
-                    FinalPart = AimPart
-                end;
-            return FinalPart
-        end;
+            local currentCamera = workspace.CurrentCamera
+            if not currentCamera then return nil end
+            local mouse = UserInputService:GetMouseLocation()
+            local bestPart, bestPriority, bestDistance = nil, math.huge, math.huge
+            for _, plr in Players:GetPlayers() do
+                local priority = TargetPriority(plr)
+                local model = plr.Character
+                local head = model and model:FindFirstChild("Head")
+                local hum = model and model:FindFirstChildOfClass("Humanoid")
+                if not priority or not head or not hum or hum.Health <= 0
+                    or model:FindFirstChildOfClass("ForceField") then continue end
+                local position, onScreen = currentCamera:WorldToViewportPoint(head.Position)
+                if not onScreen or position.Z <= 0 then continue end
+                local distance = (Vector2.new(position.X, position.Y) - mouse).Magnitude
+                if FovCircleEnabled and distance > FovCircle.Radius then continue end
+                if priority < bestPriority or (priority == bestPriority and distance < bestDistance) then
+                    bestPart, bestPriority, bestDistance = head, priority, distance
+                end
+            end
+            if SilentAimEnabled then ReportTarget(bestPart) end
+            return bestPart
+        end
 
 
 
@@ -498,19 +606,19 @@ do -- combat
                 return nil 
             end
 
-            local origin = LocalHead.Position
+            local origin = LocalHead.Position - AAOffset()
             local range = Gun:GetAttribute("Range") or math.huge
-            local best, bestDist = nil, math.huge
+            local best, bestDist, bestPriority = nil, math.huge, math.huge
+            local bestFacing = -math.huge
+            local currentCamera = workspace.CurrentCamera
+            local facing = currentCamera and currentCamera.CFrame.LookVector
+                or LocalHead.CFrame.LookVector
 
             for _, plr in Players:GetPlayers() do
-                if plr == LocalPlayer or plr.Team == LocalPlayer.Team then 
-                    continue 
-                end
+                local priority = TargetPriority(plr)
+                if not priority then continue end
                 local data = plr.Character
                 if not data then
-                    continue 
-                end
-                if LocalPlayer.Team == Teams.Guards and plr.Team == Teams.Inmates and not data:GetAttribute("Hostile") then 
                     continue 
                 end
                 if data:FindFirstChildOfClass("ForceField") then 
@@ -522,10 +630,16 @@ do -- combat
                     continue 
                 end
 
-                local dist = (head.Position - origin).Magnitude
-                if dist > range or dist >= bestDist then 
-                    continue 
-                end
+                local direction = head.Position - origin
+                local dist = direction.Magnitude
+                if dist <= 0.001 or dist > range then continue end
+                -- Preserve team priority, then favor the smallest angle to
+                -- the camera's facing direction. Distance breaks close ties.
+                local alignment = facing:Dot(direction / dist)
+                local better = priority < bestPriority
+                    or (priority == bestPriority and alignment > bestFacing + 0.001)
+                    or (priority == bestPriority and math.abs(alignment - bestFacing) <= 0.001 and dist < bestDist)
+                if not better then continue end
 
                 visparams.FilterDescendantsInstances = {LocalCharacter, data}
                 local offset
@@ -536,9 +650,10 @@ do -- combat
                 end
 
                 if offset then
-                    best, bestDist = { FinalPart = head, offset = offset }, dist
+                    best, bestDist, bestPriority, bestFacing = { FinalPart = head, offset = offset }, dist, priority, alignment
                 end
             end
+            if RageBotEnabled and best then ReportTarget(best.FinalPart) end
             return best
         end
     --#endregion
@@ -553,7 +668,7 @@ do -- combat
             restorefunction(castRay)
         end 
 
-        local old; old = hookfunction(castRay, function(p30, p31, p32, ...) 
+        local old; old = hookfunction(castRay, function(p30, p31, p32, ...)
             local t = GetTarget() 
 
             if SilentAimEnabled and t then 
@@ -586,7 +701,7 @@ do -- combat
 
             if not checkcaller() and SilentAimEnabled and SilentAimTarget and not RagebotTarget and rawequal(self, Remotes.ShootEvent) and namecallmethod == "FireServer" then
                 local Args = {...}
-                local Target = SilentAimTarget
+                local Target = GetTarget() or SilentAimTarget
                 local LocalCharacter = LocalPlayer.Character
 
                 SilentAimTarget = nil
@@ -595,7 +710,7 @@ do -- combat
                     local Head = LocalCharacter:FindFirstChild("Head")
 
                     if Head then
-                        local origin = Head.Position
+                        local origin = Head.Position - AAOffset()
 
                         if ManipEnabled then
                             local offset = findminoffset(Target, origin)
@@ -675,7 +790,7 @@ do -- combat
                 end
 
                 local FinalPart = t.FinalPart
-                local origin = LocalHead.Position + t.offset
+                local origin = LocalHead.Position - AAOffset() + t.offset
                 local Shots = {}
 
                 for i = 1, Gun:GetAttribute("ProjectileCount") or 1 do
@@ -805,15 +920,24 @@ do -- combat
         Sections.aimbot:Slider({
             Name = "manip dist";
             Flag = 'manipdist';
-            Max = 5;
+            Max = 10;
             Min = 0;
-            Default = 6;
+            Default = 2;
             Decimals = 1;
             Callback = function(v)
                 Manips = v;
             end
         })
 
+        Sections.aimbot:Slider({
+            Name = "manip scan count"; Flag = "manipscancount";
+            Min = 10; Max = 500; Default = 120; Decimals = 1;
+            Callback = function(v) ManipScanCount = v end;
+        })
+        Sections.aimbot:Toggle({
+            Name = "team priority (aim / visuals)"; Flag = "priorityteamcheck";
+            Default = true; Callback = function(v) PriorityTeamCheck = v end;
+        })
         Sections.aimbot:Toggle({
             Name = 'ragebot';
             Flag = 'ragebot';
@@ -877,6 +1001,18 @@ do -- combat
 end 
 
 
+
+-- Apply shared policy after the external ESP library has positioned its holders.
+RunService:BindToRenderStep("PriorityESPFilter", Enum.RenderPriority.Camera.Value + 2, function()
+    if not PriorityTeamCheck or not EspLib.Cache then return end
+    for plr, entry in pairs(EspLib.Cache) do
+        if not TargetPriority(plr) and entry.Holder then
+            entry.Holder.Visible = false
+            -- Keep the library's visibility state consistent so it can show it again.
+            entry.Visible = false
+        end
+    end
+end)
 
 do -- esp
 
@@ -1589,6 +1725,7 @@ local ResolverEnabled = false
 local ResolverPanelEnabled = false
 
 local ResolverPlayers = {}
+ResolverSnapshot = ResolverPlayers
 local ResolverRows = {}
 
 local ResolverSettings = {
@@ -1967,6 +2104,7 @@ Sections.visuals:Toggle({
 
     Callback = function(value)
         ResolverEnabled = value
+        ResolverRunning = value
 
         if not value then
             for _, data in pairs(ResolverPlayers) do
@@ -2480,7 +2618,7 @@ local ChamsEnabled = false
 local ChamsHighlights = {}
 
 local function ApplyChams(player)
-    if player == ChamsLocalPlayer then return end
+    if player == ChamsLocalPlayer or not TargetPriority(player) then return end
 
     local character = player.Character
     if not character then return end
@@ -2551,6 +2689,26 @@ ChamsPlayers.PlayerRemoving:Connect(function(player)
     if ChamsHighlights[player] then
         ChamsHighlights[player]:Destroy()
         ChamsHighlights[player] = nil
+    end
+end)
+
+-- Reconcile highlights when teams or the shared policy change.
+task.spawn(function()
+    while task.wait(0.5) do
+        if ChamsEnabled then
+            for _, plr in ipairs(ChamsPlayers:GetPlayers()) do
+                if plr ~= ChamsLocalPlayer then
+                    local existing = ChamsHighlights[plr]
+                    local allowed = TargetPriority(plr) ~= nil
+                    if existing and (not allowed or existing.Adornee ~= plr.Character) then
+                        existing:Destroy()
+                        ChamsHighlights[plr] = nil
+                    elseif allowed and not existing and plr.Character then
+                        ApplyChams(plr)
+                    end
+                end
+            end
+        end
     end
 end)
 
@@ -2978,5 +3136,247 @@ Sections.movement:Toggle({
 end 
 
 
+
+
+-- Advanced AA: offsets are restored before simulation and shown with a local visual copy.
+-- Replication is controlled by Roblox and is not guaranteed.
+do
+    local env = (type(getgenv) == "function" and getgenv()) or _G
+    if type(env.AdvancedAACleanup) == "function" then
+        pcall(env.AdvancedAACleanup)
+    end
+
+    local section = Pages.CombatPage:Section({Name = "advanced aa", Side = 2})
+    local settings = {
+        Enabled = false,
+        Square = true,
+        Prism = false,
+        Underground = false,
+        Range = 4,
+        Height = 4,
+        UndergroundDepth = 20,
+        Speed = 4,
+    }
+    local appliedRoot = nil
+    local appliedOffset = Vector3.zero
+    local phase = 0
+    local pausedUntil = 0
+    local promptHeld = false
+    local connections = {}
+    local renderKey = "AdvancedAA_Restore_" .. tostring(LocalPlayer.UserId)
+
+    local function restoreOffset()
+        local oldRoot, offset = appliedRoot, appliedOffset
+        appliedRoot = nil
+        appliedOffset = Vector3.zero
+        if oldRoot and oldRoot.Parent and offset.Magnitude > 0 then
+            oldRoot.CFrame = oldRoot.CFrame - offset
+        end
+    end
+
+    local function pauseAA(seconds)
+        pausedUntil = math.max(pausedUntil, os.clock() + (seconds or 1.25))
+        restoreOffset()
+    end
+    env.AdvancedAAPause = pauseAA
+    env.AdvancedAAOffset = function() return appliedOffset end
+
+    -- Pause while interacting so pickup distance checks see the undisplaced
+    -- character. Mouse clicks only pause for objects with a ClickDetector.
+    local mouse = LocalPlayer:GetMouse()
+    table.insert(connections, UserInputService.InputBegan:Connect(function(input, processed)
+        if processed then return end
+        if input.KeyCode == Enum.KeyCode.E then
+            pauseAA(1.25)
+        elseif input.UserInputType == Enum.UserInputType.MouseButton1 then
+            local object = mouse.Target
+            for _ = 1, 4 do
+                if not object or object == workspace then break end
+                if object:FindFirstChildOfClass("ClickDetector") then
+                    pauseAA(1.25)
+                    break
+                end
+                object = object.Parent
+            end
+        end
+    end))
+    local promptService = game:GetService("ProximityPromptService")
+    table.insert(connections, promptService.PromptButtonHoldBegan:Connect(function()
+        promptHeld = true
+        pauseAA(1.25)
+    end))
+    table.insert(connections, promptService.PromptButtonHoldEnded:Connect(function()
+        promptHeld = false
+        pauseAA(1.25)
+    end))
+    table.insert(connections, promptService.PromptTriggered:Connect(function()
+        promptHeld = false
+        pauseAA(1.25)
+    end))
+
+    local function square(t)
+        local p = (t % 1) * 4
+        local edge = math.floor(p)
+        local v = -1 + 2 * (p - edge)
+        if edge == 0 then return Vector3.new(v, 0, -1) end
+        if edge == 1 then return Vector3.new(1, 0, v) end
+        if edge == 2 then return Vector3.new(-v, 0, 1) end
+        return Vector3.new(-1, 0, -v)
+    end
+
+    local function calculateOffset(t)
+        local horizontal = Vector3.zero
+        -- Square and prism use the same horizontal path; enabling both does
+        -- not double its radius. Prism adds the vertical component.
+        if settings.Square or settings.Prism then horizontal = square(t) * settings.Range end
+        local height = 0
+        if settings.Prism then
+            height = (1 - math.abs(2 * ((t * 0.5) % 1) - 1)) * settings.Height
+        end
+        if settings.Underground then height -= settings.UndergroundDepth end
+        return horizontal + Vector3.new(0, height, 0)
+    end
+
+    local visual, visualCharacter, pairsList = nil, nil, {}
+    local savedTransparency = {}
+    local function destroyVisual()
+        local cam = workspace.CurrentCamera
+        if cam and visual then
+            local hum = visualCharacter and visualCharacter:FindFirstChildOfClass("Humanoid")
+            if hum and cam.CameraSubject and cam.CameraSubject:IsDescendantOf(visual) then
+                cam.CameraSubject = hum
+            end
+        end
+        for part, value in pairs(savedTransparency) do
+            if part.Parent then part.LocalTransparencyModifier = value end
+        end
+        table.clear(savedTransparency)
+        table.clear(pairsList)
+        if visual then visual:Destroy() end
+        visual, visualCharacter = nil, nil
+    end
+    local function makeVisual(character)
+        destroyVisual()
+        local was = character.Archivable
+        character.Archivable = true
+        local ok, clone = pcall(function() return character:Clone() end)
+        character.Archivable = was
+        if not ok or not clone then return end
+        visual, visualCharacter = clone, character
+        clone.Name = "AdvancedAALocalVisual"
+        for _, obj in ipairs(clone:GetDescendants()) do
+            if obj:IsA("BaseScript") then obj:Destroy()
+            elseif obj:IsA("BasePart") then
+                obj.Anchored = true
+                obj.CanCollide = false
+                obj.CanTouch = false
+                obj.CanQuery = false
+                obj.LocalTransparencyModifier = 0
+            end
+        end
+        clone.Parent = workspace
+        for _, part in ipairs(clone:GetDescendants()) do
+            if part:IsA("BasePart") then
+                local parent = part.Parent
+                local originalParent = parent == clone and character
+                    or (parent and character:FindFirstChild(parent.Name))
+                local original = originalParent and originalParent:FindFirstChild(part.Name)
+                if original and original:IsA("BasePart") then
+                    table.insert(pairsList, {part, original})
+                end
+            end
+        end
+        local hum = clone:FindFirstChildOfClass("Humanoid")
+        if hum then
+            hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+            local cam = workspace.CurrentCamera
+            if cam then cam.CameraSubject = hum end
+        end
+    end
+    local function renderVisual()
+        local character = LocalPlayer.Character
+        if not settings.Enabled or not character then destroyVisual(); return end
+        if visualCharacter ~= character or not visual then makeVisual(character) end
+        if not visual then return end
+        for _, pair in ipairs(pairsList) do
+            local copy, original = pair[1], pair[2]
+            if copy.Parent and original.Parent then
+                copy.CFrame = original.CFrame - appliedOffset
+                if savedTransparency[original] == nil then
+                    savedTransparency[original] = original.LocalTransparencyModifier
+                end
+                original.LocalTransparencyModifier = 1
+            end
+        end
+    end
+
+    table.insert(connections, RunService.PreSimulation:Connect(restoreOffset))
+    table.insert(connections, RunService.Heartbeat:Connect(function(dt)
+        restoreOffset()
+        if not settings.Enabled or promptHeld or os.clock() < pausedUntil then return end
+        local character = LocalPlayer.Character
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        if not root or not humanoid or humanoid.Health <= 0 then return end
+        phase = (phase + math.min(dt, 0.1) * settings.Speed) % 2
+        local offset = calculateOffset(phase)
+        appliedRoot = root
+        appliedOffset = offset
+        root.CFrame = root.CFrame + offset
+    end))
+
+    -- Keep the displacement through rendering to give replication a chance;
+    -- show a local copy at the undisplaced location. Server acceptance is not guaranteed.
+    RunService:BindToRenderStep(renderKey, Enum.RenderPriority.Camera.Value - 1, renderVisual)
+    table.insert(connections, LocalPlayer.CharacterRemoving:Connect(function()
+        restoreOffset()
+        destroyVisual()
+    end))
+
+    section:Toggle({
+        Name = "advanced aa", Flag = "advanced_aa_enabled", Default = false,
+        Callback = function(value)
+            settings.Enabled = value
+            if not value then restoreOffset(); destroyVisual() end
+        end,
+    })
+    section:Toggle({ Name = "square", Flag = "advanced_aa_square", Default = true,
+        Callback = function(value) settings.Square = value end })
+    section:Toggle({ Name = "prism", Flag = "advanced_aa_prism", Default = false,
+        Callback = function(value) settings.Prism = value end })
+    section:Toggle({ Name = "underground", Flag = "advanced_aa_underground", Default = false,
+        Callback = function(value) settings.Underground = value end })
+    section:Slider({
+        Name = "aa range (studs)", Flag = "advanced_aa_range",
+        Min = 0, Max = 30, Default = 4, Decimals = 1,
+        Callback = function(value) settings.Range = value end,
+    })
+    section:Slider({
+        Name = "prism height (studs)", Flag = "advanced_aa_height",
+        Min = 0, Max = 30, Default = 4, Decimals = 1,
+        Callback = function(value) settings.Height = value end,
+    })
+    section:Slider({
+        Name = "underground depth (studs)", Flag = "advanced_aa_ug_depth",
+        Min = 20, Max = 40, Default = 20, Decimals = 1,
+        Callback = function(value) settings.UndergroundDepth = value end,
+    })
+    section:Slider({
+        Name = "aa speed (cycles/sec)", Flag = "advanced_aa_speed",
+        Min = 1, Max = 40, Default = 4, Decimals = 1,
+        Callback = function(value) settings.Speed = value end,
+    })
+
+    env.AdvancedAACleanup = function()
+        settings.Enabled = false
+        restoreOffset()
+        destroyVisual()
+        RunService:UnbindFromRenderStep(renderKey)
+        for _, connection in ipairs(connections) do connection:Disconnect() end
+        table.clear(connections)
+        if env.AdvancedAAPause == pauseAA then env.AdvancedAAPause = nil end
+        env.AdvancedAAOffset = nil
+    end
+end
 
 Window:InitWindow()
