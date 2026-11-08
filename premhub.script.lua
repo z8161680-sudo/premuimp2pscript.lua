@@ -204,6 +204,10 @@
 
     local CreateTracer;
     local TracerEnabled = false;
+    local TracerSpeed = 900;
+    local TracerBend = 0.75;
+    local TracerEffect = "Beam";
+    local TracerPath = "Curved";
 
     local SelectedTracer = "Laser 1";
 
@@ -286,6 +290,7 @@
 -- Shared team policy for aim, ESP and chams. Unknown teams fall back to
 -- same-team exclusion instead of guessing their role.
 local CurrentTargetPlayer, CurrentTargetTime = nil, 0
+local ShotScanResults = setmetatable({}, {__mode = "k"})
 local ResolverSnapshot = nil
 local ResolverRunning = false
 local function ReportTarget(part)
@@ -295,6 +300,7 @@ local function ReportTarget(part)
 end
 
 local PriorityTeamCheck = true
+local AggroThreatRange = 80
 local function TeamRole(player)
     local name = player.Team and string.lower(player.Team.Name) or ""
     if name:find("guard", 1, true) or name:find("police", 1, true) then return "police" end
@@ -322,6 +328,54 @@ local function TargetPriority(player)
     return 1
 end
 
+-- Guards must not target non-hostile or restrained prisoners. Prefer the
+-- game's Hostile attribute; textual icon fallback only applies if absent.
+local function IsHostilePrisoner(plr)
+    local model = plr and plr.Character
+    if not model then return false end
+    if model:GetAttribute("Cuffed") == true or model:GetAttribute("Arrested") == true then
+        return false
+    end
+    local angryIcon, cuffIcon = false, false
+    for _, obj in ipairs(model:GetDescendants()) do
+        if obj:IsA("TextLabel") or obj:IsA("TextButton") then
+            local text = obj.Text or ""
+            local lower = string.lower(text)
+            if lower:find("cuff", 1, true) or text:find("🔒", 1, true)
+                or text:find("⛓", 1, true) or text:find("🔗", 1, true) then
+                cuffIcon = true
+            end
+            if text:find("💢", 1, true) or text:find("😡", 1, true) then
+                angryIcon = true
+            end
+        end
+    end
+    if cuffIcon then return false end
+    local hostile = model:GetAttribute("Hostile")
+    if hostile ~= nil then return hostile == true end
+    return angryIcon
+end
+
+-- Combat-only priority; visual filtering remains independent.
+local function CombatPriority(plr)
+    if not plr or plr == LocalPlayer then return nil end
+    local localRole, targetRole = TeamRole(LocalPlayer), TeamRole(plr)
+    if localRole == "police" and targetRole == "prisoner" and not IsHostilePrisoner(plr) then
+        return nil
+    end
+    local priority = TargetPriority(plr)
+    if not priority then return nil end
+    if localRole == "police" and targetRole == "prisoner" then
+        local own = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        local model = plr.Character
+        local root = model and model:FindFirstChild("HumanoidRootPart")
+        if own and root and (root.Position - own.Position).Magnitude <= AggroThreatRange then
+            return 0
+        end
+    end
+    return priority
+end
+
 local function AAOffset()
     local env = (type(getgenv) == "function" and getgenv()) or _G
     if type(env.AdvancedAAOffset) == "function" then
@@ -330,6 +384,75 @@ local function AAOffset()
     end
     return Vector3.zero
 end
+
+local function AARealPartPosition(part)
+    local env = (type(getgenv) == "function" and getgenv()) or _G
+    if type(env.AdvancedAAUnshiftPosition) == "function" then
+        local ok, position = pcall(env.AdvancedAAUnshiftPosition, part.Position)
+        if ok and typeof(position) == "Vector3" then return position end
+    end
+    return part.Position - AAOffset()
+end
+
+-- Rays must ignore the local AA visual copy: it sits at the real position and
+-- used to block our own silent-aim, hitscan and manipulation casts.
+local function AAIgnoreList()
+    local list = {}
+    local character = LocalPlayer.Character
+    if character then table.insert(list, character) end
+    for _, obj in ipairs(workspace:GetChildren()) do
+        if obj.Name == "AdvancedAALocalVisual" then table.insert(list, obj) end
+    end
+    return list
+end
+
+-- Shared with the aim, tracer and visual code below.
+local HitboxExpander = { Enabled = false, Size = 1.5, Visual = true, Samples = 12,
+    Color = Color3.fromRGB(120, 190, 255), Transparency = 0.8,
+    State = {}, Cache = {} }
+
+-- Samples the expanded hull around a target and returns the first point that
+-- has a clear line back to the origin. Visible hull means "try to shoot".
+function HitboxExpander.Probe(player, origin)
+    if not player or typeof(origin) ~= "Vector3" then return nil end
+    local character = player.Character
+    local body = character and (character:FindFirstChild("UpperTorso")
+        or character:FindFirstChild("Torso")
+        or character:FindFirstChild("HumanoidRootPart"))
+    if not body then return nil end
+    local now = os.clock()
+    local cached = HitboxExpander.Cache[player]
+    if cached and now - cached.time < 0.08 then return cached.point, cached.part end
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = AAIgnoreList()
+    local radius = math.max(HitboxExpander.Size, 0.05)
+    local count = math.clamp(math.floor(HitboxExpander.Samples), 4, 64)
+    local golden = math.pi * (3 - math.sqrt(5))
+    local bestPoint, bestPart
+    for i = 1, count do
+        local y = 1 - 2 * ((i - 0.5) / count)
+        local radial = math.sqrt(math.max(0, 1 - y * y))
+        local angle = i * golden
+        local unit = Vector3.new(math.cos(angle) * radial, y, math.sin(angle) * radial)
+        local half = body.Size * 0.5 + Vector3.new(radius, radius, radius)
+        local point = body.CFrame:PointToWorldSpace(Vector3.new(unit.X * half.X, unit.Y * half.Y, unit.Z * half.Z))
+        local delta = point - origin
+        if delta.Magnitude > 0.01 then
+            local hit = workspace:Raycast(origin, delta * 1.01, params)
+            if not hit or hit.Instance:IsDescendantOf(character) then
+                bestPoint, bestPart = point, body
+                break
+            end
+        end
+    end
+    HitboxExpander.State[player] = { visible = bestPoint ~= nil, time = now }
+    HitboxExpander.Cache[player] = { point = bestPoint, part = bestPart, time = now }
+    return bestPoint, bestPart
+end
+
+-- Written by the aim toggles so the panel can show readiness even with no target.
+local AimState = { Silent = false, Ragebot = false, Origin = nil }
 
 local function PauseAAForAction(seconds)
     local env = (type(getgenv) == "function" and getgenv()) or _G
@@ -348,8 +471,8 @@ do
     gui.ResetOnSpawn = false
     gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
     local box = Instance.new("Frame")
-    box.Size = UDim2.fromOffset(280, 108)
-    box.Position = UDim2.new(0.5, -140, 0.7, 0)
+    box.Size = UDim2.fromOffset(310, 158)
+    box.Position = UDim2.new(0.5, -155, 0.7, 0)
     box.BackgroundColor3 = Color3.fromRGB(18, 20, 27)
     box.BorderSizePixel = 0
     box.Visible = false
@@ -374,7 +497,7 @@ do
     avatar.BackgroundColor3 = Color3.fromRGB(31, 35, 45)
     local detail = Instance.new("TextLabel", box)
     detail.Position = UDim2.fromOffset(84, 30)
-    detail.Size = UDim2.new(1, -90, 0, 73)
+    detail.Size = UDim2.new(1, -90, 0, 124)
     detail.BackgroundTransparency = 1
     detail.Font = Enum.Font.Gotham
     detail.TextSize = 12
@@ -386,7 +509,38 @@ do
         Name = "targeting panel", Flag = "targetingpanel", Default = true,
         Callback = function(value) shown = value end,
     })
+    local visCache = { player = nil, time = 0, text = "Visibility: —" }
+    local function visibilityText(p, origin)
+        local now = os.clock()
+        if visCache.player == p and now - visCache.time < 0.12 then return visCache.text end
+        local text = "Visibility: no target"
+        local character = p and p.Character
+        local head = character and character:FindFirstChild("Head")
+        if head and origin then
+            local params = RaycastParams.new()
+            params.FilterType = Enum.RaycastFilterType.Exclude
+            params.FilterDescendantsInstances = AAIgnoreList()
+            local delta = head.Position - origin
+            local hit = workspace:Raycast(origin, delta * 1.01, params)
+            if not hit or hit.Instance:IsDescendantOf(character) then
+                text = "Visibility: visible"
+            else
+                local back = workspace:Raycast(head.Position, -delta, params)
+                local thickness = back and back.Instance == hit.Instance
+                    and (head.Position - back.Position).Magnitude or math.huge
+                if thickness < math.huge then
+                    text = string.format("Visibility: wall %.2f", thickness)
+                else
+                    text = "Visibility: hidden"
+                end
+            end
+        end
+        visCache.player, visCache.time, visCache.text = p, now, text
+        return text
+    end
+
     RunService.RenderStepped:Connect(function()
+        local armed = AimState.Silent or AimState.Ragebot
         local p = CurrentTargetPlayer
         local c = p and p.Character
         local h = c and c:FindFirstChildOfClass("Humanoid")
@@ -394,15 +548,46 @@ do
         local own = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
         local active = p and p.Parent == Players and h and h.Health > 0 and r and own
             and os.clock() - CurrentTargetTime < 1
-        box.Visible = shown and not not active
-        if not active then return end
+        box.Visible = shown and (not not active or armed)
+        if not box.Visible then return end
+
+        local aimText = "Aim: off"
+        if AimState.Silent and AimState.Ragebot then
+            aimText = "Aim: silent + ragebot ready"
+        elseif AimState.Silent then
+            aimText = "Aim: silent ready"
+        elseif AimState.Ragebot then
+            aimText = "Aim: ragebot ready"
+        end
+
+        if not active then
+            lastAvatar = nil
+            avatar.Image = ""
+            detail.Text = string.format("No target in view\n%s\nScan: idle | HBE: %s",
+                aimText, HitboxExpander.Enabled and "on" or "off")
+            return
+        end
+
         local status = ResolverRunning and "Unknown (no sample)" or "Unknown (resolver off)"
         local data = ResolverSnapshot and ResolverSnapshot[p]
         if ResolverRunning and data and data.LastPosition then
             status = data.Flagged and "Dangerous (flagged)" or "Safe (not flagged)"
         end
-        detail.Text = string.format("%s (@%s)\nHealth: %.0f / %.0f\nDistance: %.0f studs\n%s",
-            p.DisplayName, p.Name, h.Health, h.MaxHealth, (r.Position - (own.Position - AAOffset())).Magnitude, status)
+        local scan = ShotScanResults[p]
+        local scanText = scan and os.clock() - scan.time < 1.5 and scan.label or "Not scanned"
+        local hbe = HitboxExpander.State[p]
+        local hbeText = "HBE: off"
+        if HitboxExpander.Enabled then
+            hbeText = (hbe and os.clock() - hbe.time < 1 and hbe.visible)
+                and "HBE: visible" or "HBE: covered"
+        end
+        local origin = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Head")
+        origin = origin and AARealPartPosition(origin) or nil
+        detail.Text = string.format(
+            "%s (@%s)\nHealth: %.0f / %.0f\nDistance: %.0f studs\n%s\n%s\n%s\nScan: %s | %s",
+            p.DisplayName, p.Name, h.Health, h.MaxHealth,
+            (r.Position - (own.Position - AAOffset())).Magnitude, status,
+            visibilityText(p, origin), aimText, scanText, hbeText)
         if lastAvatar ~= p.UserId then
             local id = p.UserId
             lastAvatar = id
@@ -423,6 +608,38 @@ do -- combat
     local ManipEnabled = false;
     local Manips = 2;
     local ManipScanCount = 120;
+    local HitScanEnabled = false;
+    local HitScanCount = 32;
+    local WallbangAttemptEnabled = false;
+    local WallbangMaxThickness = 1.25;
+    -- Failsafe: fire normally first, and only fall back to snapping the
+    -- character back (AA pause) after repeated shots fail to register.
+    local FailsafeEnabled = true;
+    local FailsafeAttempts = 3;
+    local FailsafeMissStreak = 0;
+    local FailsafePending = false;
+
+    local function FailsafeReady()
+        return FailsafeEnabled and FailsafeMissStreak >= FailsafeAttempts;
+    end
+
+    local function FailsafeWatch(targetPlayer)
+        if not FailsafeEnabled or not targetPlayer or FailsafePending then return end
+        local character = targetPlayer.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        if not humanoid then return end
+        local before = humanoid.Health;
+        FailsafePending = true;
+        task.delay(0.35, function()
+            FailsafePending = false;
+            if not humanoid.Parent then return end
+            if humanoid.Health < before then
+                FailsafeMissStreak = 0;
+            else
+                FailsafeMissStreak += 1;
+            end
+        end)
+    end
     local ScanProgress = 0;
     local ScanStatus = "idle";
     local NoRecoilEnabled = false;
@@ -442,52 +659,193 @@ do -- combat
 
     --#region tracers
 
-            CreateTracer = function(origin, direction)
-                local data = Trails[SelectedTracer]
-                if not data then
-                    return
+            -- Animated tracer: the head travels from muzzle to the resolved
+            -- point at TracerSpeed. The midpoint is pushed along the manip
+            -- offset so the curve shows how the shot was bent. Purely visual.
+            local function samplePath(path, travelled)
+                for i = 1, #path - 1 do
+                    local from, to = path[i], path[i + 1]
+                    local length = (to - from).Magnitude
+                    if travelled <= length or i == #path - 1 then
+                        local alpha = length > 0.001 and math.clamp(travelled / length, 0, 1) or 1
+                        return from:Lerp(to, alpha)
+                    end
+                    travelled -= length
                 end
-                local result = workspace:Raycast(origin, direction * 2000, autofireparams)
-                local hitDist = result and (result.Position - origin).Magnitude or 2000
-                hitDist = math.max(hitDist, 150)
-                local endPos = origin + direction * hitDist
-                local p = Instance.new("Part")
-                p.Anchored = true
-                p.CanCollide = false
-                p.Transparency = 1
-                p.Size = Vector3.new(0.1, 0.1, 0.1)
-                p.Position = origin
-                p.Parent = workspace
-                local a = Instance.new("Attachment")
-                a.Parent = p
-                a.Position = Vector3.zero
-                local b = Instance.new("Attachment")
-                b.Parent = p
-                b.Position = endPos - origin
-                local beam = Instance.new("Beam")
-                beam.Attachment0 = a
-                beam.Attachment1 = b
-                beam.Texture = data.Texture
-                beam.Width0 = data.Width0
-                beam.Width1 = data.Width1
-                beam.TextureLength = data.TextureLength
-                beam.TextureMode = Enum.TextureMode.Wrap
-                beam.LightEmission = 1
-                beam.LightInfluence = 0
-                beam.Transparency = NumberSequence.new(0.45)
-                beam.Parent = p
+                return path[#path]
+            end
+
+            CreateTracer = function(origin, hitPoint, bendOffset)
+                local data = Trails[SelectedTracer]
+                if not data or typeof(origin) ~= "Vector3" then return end
+                if typeof(hitPoint) ~= "Vector3" then
+                    hitPoint = origin + Vector3.new(0, 0, -200)
+                end
+                local bend = (typeof(bendOffset) == "Vector3" and bendOffset or Vector3.zero) * TracerBend
+                local segment = hitPoint - origin
+                local length = segment.Magnitude
+                local forward = length > 0.001 and segment.Unit or Vector3.new(0, 0, -1)
+                local path
+                if TracerPath == "Straight" then
+                    path = { origin, hitPoint }
+                elseif TracerPath == "Lightning" then
+                    local right = forward:Cross(Vector3.new(0, 1, 0))
+                    if right.Magnitude < 0.01 then right = forward:Cross(Vector3.new(1, 0, 0)) end
+                    right = right.Unit
+                    local up = right:Cross(forward).Unit
+                    local zigzags = math.clamp(math.floor(length / 6), 3, 14)
+                    local amplitude = math.max(length * 0.03, 0.4) * math.max(TracerBend, 0.15)
+                    path = { origin }
+                    for i = 1, zigzags - 1 do
+                        local alpha = i / zigzags
+                        local sign = (i % 2 == 0) and 1 or -1
+                        local offset = right * (sign * amplitude * (0.4 + math.random()))
+                            + up * (amplitude * 0.5 * (math.random() - 0.5))
+                            + bend * alpha
+                        table.insert(path, origin:Lerp(hitPoint, alpha) + offset)
+                    end
+                    table.insert(path, hitPoint)
+                else
+                    -- Curved: try to arc around the obstacle that blocks the
+                    -- direct line, otherwise fall back to the bend offset.
+                    local params = RaycastParams.new()
+                    params.FilterType = Enum.RaycastFilterType.Exclude
+                    params.FilterDescendantsInstances = AAIgnoreList()
+                    local function clear(a, b)
+                        local delta = b - a
+                        if delta.Magnitude < 0.05 then return true end
+                        local hit = workspace:Raycast(a, delta, params)
+                        return hit == nil
+                    end
+                    local control = nil
+                    if not clear(origin, hitPoint) then
+                        local direction = forward
+                        local right = direction:Cross(Vector3.new(0, 1, 0))
+                        if right.Magnitude < 0.01 then right = direction:Cross(Vector3.new(1, 0, 0)) end
+                        right = right.Unit
+                        local up = right:Cross(direction).Unit
+                        local middle = origin:Lerp(hitPoint, 0.5)
+                        local directions = { right, up, (right + up).Unit, (right - up).Unit, -right, -up }
+                        for _, radius in ipairs({ 4, 7, 11, 16, 24, 34 }) do
+                            for _, axis in ipairs(directions) do
+                                local candidate = middle + axis * radius
+                                if clear(origin, candidate) and clear(candidate, hitPoint) then
+                                    control = candidate
+                                    break
+                                end
+                            end
+                            if control then break end
+                        end
+                    end
+                    local anchor = control or (origin:Lerp(hitPoint, 0.5) + bend)
+                    anchor += bend * 0.25
+                    local steps = math.clamp(math.floor((hitPoint - origin).Magnitude / 4), 6, 20)
+                    path = {}
+                    for i = 0, steps do
+                        local alpha = i / steps
+                        local inverse = 1 - alpha
+                        local point = origin * (inverse * inverse)
+                            + anchor * (2 * inverse * alpha)
+                            + hitPoint * (alpha * alpha)
+                        table.insert(path, point)
+                    end
+                end
+
+                local nodes = {}
+                local function nodeAt(position)
+                    local node = Instance.new("Part")
+                    node.Anchored, node.CanCollide, node.CanQuery = true, false, false
+                    node.Transparency = 1
+                    node.Size = Vector3.new(0.2, 0.2, 0.2)
+                    node.CFrame = CFrame.new(position)
+                    node.Parent = workspace
+                    table.insert(nodes, node)
+                    return node
+                end
+
+                local beams = {}
+                if TracerEffect ~= "Orb" then
+                    -- Full path is drawn at once so the tracer reads as one
+                    -- continuous line instead of a ball drifting along.
+                    local previous = nodeAt(path[1])
+                    for i = 2, #path do
+                        local current = nodeAt(path[i])
+                        if (path[i] - path[i - 1]).Magnitude > 0.05 then
+                            local a0 = Instance.new("Attachment", previous)
+                            local a1 = Instance.new("Attachment", current)
+                            local beam = Instance.new("Beam")
+                            beam.Attachment0, beam.Attachment1 = a0, a1
+                            beam.Texture = data.Texture
+                            beam.Width0, beam.Width1 = data.Width0, data.Width1
+                            beam.TextureLength = data.TextureLength
+                            beam.TextureMode = Enum.TextureMode.Wrap
+                            beam.LightEmission, beam.LightInfluence = 1, 0
+                            beam.FaceCamera = true
+                            beam.Transparency = NumberSequence.new(0.2)
+                            beam.Parent = previous
+                            table.insert(beams, beam)
+                        end
+                        previous = current
+                    end
+                end
+
+                local head, trail
+                if TracerEffect == "Orb" or TracerEffect == "Trail" then
+                    head = Instance.new("Part")
+                    head.Anchored, head.CanCollide, head.CanQuery = true, false, false
+                    head.Material = Enum.Material.Neon
+                    head.Color = Color3.fromRGB(200, 235, 255)
+                    head.Size = Vector3.new(0.35, 0.35, 0.35)
+                    head.Shape = Enum.PartType.Ball
+                    head.CFrame = CFrame.new(TracerEffect == "Orb" and origin or hitPoint)
+                    head.Parent = workspace
+                    if TracerEffect == "Trail" then
+                        local a0 = Instance.new("Attachment", nodes[1])
+                        local a1 = Instance.new("Attachment", head)
+                        trail = Instance.new("Trail")
+                        trail.Attachment0, trail.Attachment1 = a0, a1
+                        trail.Lifetime = 0.35
+                        trail.LightEmission = 1
+                        trail.Color = ColorSequence.new(Color3.fromRGB(180, 225, 255), Color3.fromRGB(90, 130, 255))
+                        trail.Parent = head
+                    end
+                end
+
                 task.spawn(function()
-                    local duration = data.Lifetime
-                    local start = os.clock()
-                    while os.clock() - start < duration do
-                        local progress = (os.clock() - start) / duration
-                        beam.Transparency = NumberSequence.new(0.45 + (0.55 * progress))
+                    local lifetime = math.max(data.Lifetime or 1, 0.1)
+                    if head and TracerEffect == "Orb" then
+                        local total = 0
+                        for i = 1, #path - 1 do total += (path[i + 1] - path[i]).Magnitude end
+                        local travelled = 0
+                        local previous = os.clock()
+                        while travelled < total and head.Parent do
+                            local now = os.clock()
+                            local dt = math.clamp(now - previous, 0, 0.1)
+                            previous = now
+                            travelled += math.max(TracerSpeed, 1) * dt
+                            local position = samplePath(path, travelled)
+                            head.CFrame = CFrame.new(position)
+                            task.wait()
+                        end
+                    end
+                    local fadeStart = os.clock()
+                    while os.clock() - fadeStart < lifetime do
+                        local progress = (os.clock() - fadeStart) / lifetime
+                        for _, beam in ipairs(beams) do
+                            if beam.Parent then
+                                beam.Transparency = NumberSequence.new(0.2 + 0.8 * progress)
+                            end
+                        end
+                        if head and head.Parent then head.Transparency = progress end
                         task.wait()
                     end
-                    p:Destroy()
+                    if head and head.Parent then head:Destroy() end
+                    for _, node in ipairs(nodes) do
+                        if node.Parent then node:Destroy() end
+                    end
                 end)
             end
-    
+
     --#endregion
     
     
@@ -497,17 +855,17 @@ do -- combat
         local cachedoffset = nil
         --local lastShotTarget = nil
 
-        autofireparams.FilterDescendantsInstances = {LocalPlayer.Character}
+        autofireparams.FilterDescendantsInstances = AAIgnoreList()
 
         LocalPlayer.CharacterAdded:Connect(function(char)
-            autofireparams.FilterDescendantsInstances = {char}
+            autofireparams.FilterDescendantsInstances = AAIgnoreList()
         end)
 
         -- Fixed raycast budget; samples points throughout a sphere, including
         -- near and far offsets. A wider range does not override server checks.
         function findminoffset(target, origin, ignorezeropos)
             if not target or not target.Parent then return nil, false, nil end
-            autofireparams.FilterDescendantsInstances = {LocalPlayer.Character}
+            autofireparams.FilterDescendantsInstances = AAIgnoreList()
             local function test(offset)
                 if not target.Parent then return nil end
                 -- Reject origins reached through a wall. This is only a
@@ -574,7 +932,7 @@ do -- combat
             local mouse = UserInputService:GetMouseLocation()
             local bestPart, bestPriority, bestDistance = nil, math.huge, math.huge
             for _, plr in Players:GetPlayers() do
-                local priority = TargetPriority(plr)
+                local priority = CombatPriority(plr)
                 local model = plr.Character
                 local head = model and model:FindFirstChild("Head")
                 local hum = model and model:FindFirstChildOfClass("Humanoid")
@@ -599,6 +957,107 @@ do -- combat
         visparams.CollisionGroup = "ClientBullet"
         local gameReload = filtergc("function", {Name = "reload", Constants = {"ReloadSound"}}, true)
 
+        -- Fibonacci surface sampling searches visible points on body parts.
+        -- A blocked ray is only a wallbang *candidate*: Roblox/game server
+        -- validation determines whether any through-wall shot is accepted.
+        local function EvaluateShot(target, origin)
+            if not target or not target.Parent then return nil end
+            local model = target:FindFirstAncestorOfClass("Model")
+            if not model then return nil end
+            local plr = Players:GetPlayerFromCharacter(model)
+            local function report(label)
+                if plr then ShotScanResults[plr] = {label = label, time = os.clock()} end
+            end
+            local params = RaycastParams.new()
+            params.FilterType = Enum.RaycastFilterType.Exclude
+            params.FilterDescendantsInstances = AAIgnoreList()
+
+            -- Wall thickness along one sample ray. nil means the ray never
+            -- reached the target, math.huge means it hit too much geometry.
+            local function measure(point)
+                local direction = point - origin
+                if direction.Magnitude < 0.001 then return "miss", nil, math.huge end
+                local hit = workspace:Raycast(origin, direction * 1.01, params)
+                if hit and hit.Instance:IsDescendantOf(model) then return "clear", hit, 0 end
+                if not hit then return "miss", nil, math.huge end
+                local back = workspace:Raycast(point, -direction, params)
+                if back and back.Instance == hit.Instance then
+                    return "blocked", hit, (point - back.Position).Magnitude
+                end
+                return "blocked", hit, math.huge
+            end
+
+            -- Direct line to the head first: a through-wall shot should stay on
+            -- that line instead of being pushed sideways around the obstacle.
+            local state, _, directThickness = measure(target.Position)
+            if state == "clear" then
+                report("Direct: clear")
+                return {FinalPart = target, point = target.Position, offset = Vector3.zero, quality = 1}
+            end
+            local blockedThickness = directThickness
+
+            -- The expander says the target is reachable: fire at that hull point.
+            if HitboxExpander.Enabled and plr then
+                local hbePoint, hbePart = HitboxExpander.Probe(plr, origin)
+                if hbePoint and hbePart then
+                    report("HBE: visible")
+                    return {FinalPart = hbePart, point = hbePoint, offset = Vector3.zero, quality = 1.2}
+                end
+            end
+
+            local parts = {target}
+            if HitScanEnabled or HitboxExpander.Enabled then
+                for _, name in ipairs({"UpperTorso", "Torso", "LowerTorso", "LeftUpperArm", "RightUpperArm", "Left Arm", "Right Arm", "Left Leg", "Right Leg"}) do
+                    local part = model:FindFirstChild(name)
+                    if part and part:IsA("BasePart") and part ~= target then table.insert(parts, part) end
+                end
+            end
+            local expand = HitboxExpander.Enabled and math.max(HitboxExpander.Size, 0) or 0
+            local count = HitScanEnabled and math.clamp(math.floor(HitScanCount), 1, 200) or 1
+            local golden = math.pi * (3 - math.sqrt(5))
+            for i = 1, count do
+                local part = parts[((i - 1) % #parts) + 1]
+                local point = part.Position
+                if i > 1 or expand > 0 then
+                    local y = 1 - 2 * ((i - 0.5) / math.max(count, 1))
+                    local radial = math.sqrt(math.max(0, 1 - y * y))
+                    local angle = i * golden
+                    local unit = Vector3.new(math.cos(angle) * radial, y, math.sin(angle) * radial)
+                    local half = part.Size * 0.42 + Vector3.new(expand, expand, expand)
+                    point = part.CFrame:PointToWorldSpace(Vector3.new(unit.X * half.X, unit.Y * half.Y, unit.Z * half.Z))
+                end
+                local sampleState, hit, thickness = measure(point)
+                if sampleState == "clear" then
+                    report(HitScanEnabled and "Hitscan: clear" or "Direct: clear")
+                    return {FinalPart = hit.Instance, point = hit.Position, offset = Vector3.zero, quality = 1}
+                elseif sampleState == "blocked" and thickness < blockedThickness then
+                    blockedThickness = thickness
+                end
+            end
+
+            -- Through a thin wall on the direct line beats walking the ray
+            -- around cover, so it is offered before manipulation.
+            if WallbangAttemptEnabled and blockedThickness <= WallbangMaxThickness then
+                report(string.format("Wallbang: verified (%.2f studs)", blockedThickness))
+                return {FinalPart = target, point = target.Position, offset = Vector3.zero, quality = 1.5}
+            end
+
+            if ManipEnabled then
+                local offset, _, hitPart = findminoffset(target, origin, true)
+                if offset and hitPart then
+                    report("Manipulated: candidate")
+                    return {FinalPart = hitPart, point = hitPart.Position, offset = offset, quality = 2}
+                end
+            end
+
+            if WallbangAttemptEnabled and blockedThickness < math.huge then
+                report(string.format("Wallbang: skipped (%.1f studs)", math.min(blockedThickness, 99)))
+            else
+                report(blockedThickness < math.huge and "Blocked" or "No hit")
+            end
+            return nil
+        end
+
         function GetVisibleTarget(Gun)
             local LocalCharacter = LocalPlayer.Character
             local LocalHead = LocalCharacter and LocalCharacter:FindFirstChild("Head")
@@ -606,16 +1065,17 @@ do -- combat
                 return nil 
             end
 
-            local origin = LocalHead.Position - AAOffset()
+            local origin = AARealPartPosition(LocalHead)
             local range = Gun:GetAttribute("Range") or math.huge
             local best, bestDist, bestPriority = nil, math.huge, math.huge
             local bestFacing = -math.huge
+            local bestQuality = math.huge
             local currentCamera = workspace.CurrentCamera
             local facing = currentCamera and currentCamera.CFrame.LookVector
                 or LocalHead.CFrame.LookVector
 
             for _, plr in Players:GetPlayers() do
-                local priority = TargetPriority(plr)
+                local priority = CombatPriority(plr)
                 if not priority then continue end
                 local data = plr.Character
                 if not data then
@@ -636,21 +1096,17 @@ do -- combat
                 -- Preserve team priority, then favor the smallest angle to
                 -- the camera's facing direction. Distance breaks close ties.
                 local alignment = facing:Dot(direction / dist)
-                local better = priority < bestPriority
-                    or (priority == bestPriority and alignment > bestFacing + 0.001)
-                    or (priority == bestPriority and math.abs(alignment - bestFacing) <= 0.001 and dist < bestDist)
-                if not better then continue end
-
-                visparams.FilterDescendantsInstances = {LocalCharacter, data}
-                local offset
-                if not workspace:Raycast(origin, head.Position - origin, visparams) then
-                    offset = Vector3.zero
-                elseif ManipEnabled then
-                    offset = findminoffset(head, origin, true)
-                end
-
-                if offset then
-                    best, bestDist, bestPriority, bestFacing = { FinalPart = head, offset = offset }, dist, priority, alignment
+                if priority > bestPriority then continue end
+                local plan = EvaluateShot(head, origin)
+                if plan then
+                    local better = priority < bestPriority
+                        or (priority == bestPriority and plan.quality < bestQuality)
+                        or (priority == bestPriority and plan.quality == bestQuality and alignment > bestFacing + 0.001)
+                        or (priority == bestPriority and plan.quality == bestQuality
+                            and math.abs(alignment - bestFacing) <= 0.001 and dist < bestDist)
+                    if better then
+                        best, bestDist, bestPriority, bestFacing, bestQuality = plan, dist, priority, alignment, plan.quality
+                    end
                 end
             end
             if RageBotEnabled and best then ReportTarget(best.FinalPart) end
@@ -669,19 +1125,28 @@ do -- combat
         end 
 
         local old; old = hookfunction(castRay, function(p30, p31, p32, ...)
-            local t = GetTarget() 
-
-            if SilentAimEnabled and t then 
-                SilentAimTarget = t
-
-                if TracerEnabled then 
-                    CreateTracer(p30, (t.Position - p30).Unit)
-                end 
-
-                return t, t.Position 
-            end 
-
-
+            local character = LocalPlayer.Character
+            local head = character and character:FindFirstChild("Head")
+            local realOrigin = head and AARealPartPosition(head)
+            local target = SilentAimEnabled and GetTarget()
+            if target and realOrigin then
+                local plan = EvaluateShot(target, realOrigin)
+                -- Underground shifts the visible body; fall back to the game's
+                -- own cast origin (usually the camera) if the simulated head
+                -- path is blocked, so shots still resolve while displaced.
+                if not plan and typeof(p30) == "Vector3" and (realOrigin - p30).Magnitude > 4 then
+                    plan = EvaluateShot(target, p30)
+                end
+                if plan then
+                    SilentAimTarget = target
+                    if TracerEnabled then
+                        local tracerOrigin = (typeof(p30) == "Vector3") and p30 or realOrigin
+                        CreateTracer(tracerOrigin, plan.point, plan.offset)
+                    end
+                    return plan.FinalPart, plan.point
+                end
+            end
+            SilentAimTarget = nil
             return old(p30, p31, p32, ...)
         end)
 
@@ -701,29 +1166,31 @@ do -- combat
 
             if not checkcaller() and SilentAimEnabled and SilentAimTarget and not RagebotTarget and rawequal(self, Remotes.ShootEvent) and namecallmethod == "FireServer" then
                 local Args = {...}
-                local Target = GetTarget() or SilentAimTarget
+                local Target = GetTarget()
                 local LocalCharacter = LocalPlayer.Character
-
                 SilentAimTarget = nil
+                if not Target then
+                    setnamecallmethod(namecallmethod)
+                    return mtHook(self, ...)
+                end
 
                 if LocalCharacter and type(Args[1]) == 'table' then
                     local Head = LocalCharacter:FindFirstChild("Head")
 
                     if Head then
-                        local origin = Head.Position - AAOffset()
+                        local origin = AARealPartPosition(Head)
 
-                        if ManipEnabled then
-                            local offset = findminoffset(Target, origin)
-
-                            if offset then
-                                origin = origin + offset
+                        if FailsafeReady() then PauseAAForAction(0.25) end
+                        local plan = Target and EvaluateShot(Target, origin)
+                        if plan then
+                            origin += plan.offset
+                            for _, v in Args[1] do
+                                v[1] = origin
+                                v[2] = plan.point
+                                v[3] = plan.FinalPart
                             end
-                        end
-
-                        for i, v in Args[1] do
-                            v[1] = origin
-                            v[2] = Target.Position
-                            v[3] = Target
+                            local hitModel = plan.FinalPart and plan.FinalPart:FindFirstAncestorOfClass("Model")
+                            FailsafeWatch(hitModel and Players:GetPlayerFromCharacter(hitModel))
                         end
                     end
                 end
@@ -790,20 +1257,26 @@ do -- combat
                 end
 
                 local FinalPart = t.FinalPart
-                local origin = LocalHead.Position - AAOffset() + t.offset
+                local targetModel = FinalPart and FinalPart:FindFirstAncestorOfClass("Model")
+                local targetPlayer = targetModel and Players:GetPlayerFromCharacter(targetModel)
+                if not targetPlayer or not CombatPriority(targetPlayer) then continue end
+                -- Only snap back once several shots in a row have failed.
+                if FailsafeReady() then PauseAAForAction(0.25) end
+                local origin = AARealPartPosition(LocalHead) + t.offset
                 local Shots = {}
 
                 for i = 1, Gun:GetAttribute("ProjectileCount") or 1 do
-                    Shots[i] = { origin, FinalPart.Position, FinalPart }
+                    Shots[i] = { origin, t.point, FinalPart }
                 end
 
                 LastShot = os.clock()
 
                 if TracerEnabled then
-                    CreateTracer(origin, (FinalPart.Position - origin).Unit)
+                    CreateTracer(origin, t.point, t.offset)
                 end
 
                 Remotes.ShootEvent:FireServer(Shots)
+                FailsafeWatch(targetPlayer)
                 Gun:SetAttribute("Local_CurrentAmmo", Ammo - 1)
             end
         end)
@@ -874,6 +1347,7 @@ do -- combat
             Default = false;
             Callback = function(v)
                 SilentAimEnabled = v;
+                AimState.Silent = v;
             end
         })
 
@@ -920,7 +1394,7 @@ do -- combat
         Sections.aimbot:Slider({
             Name = "manip dist";
             Flag = 'manipdist';
-            Max = 10;
+            Max = 20;
             Min = 0;
             Default = 2;
             Decimals = 1;
@@ -935,6 +1409,29 @@ do -- combat
             Callback = function(v) ManipScanCount = v end;
         })
         Sections.aimbot:Toggle({
+            Name = "hitscan"; Flag = "fibonaccihitscan"; Default = false;
+            Callback = function(v) HitScanEnabled = v end;
+        })
+        Sections.aimbot:Slider({
+            Name = "hitscan samples"; Flag = "hitscansamples";
+            Min = 1; Max = 200; Default = 32; Decimals = 1;
+            Callback = function(v) HitScanCount = v end;
+        })
+        Sections.aimbot:Slider({
+            Name = "wallbangprivate max wall (studs)"; Flag = "wallbangprivate_thickness";
+            Min = 0.25; Max = 5; Default = 1.25; Decimals = 2;
+            Callback = function(v) WallbangMaxThickness = v end;
+        })
+        Sections.aimbot:Toggle({
+            Name = "wallbangprivate"; Flag = "wallbangprivate"; Default = false;
+            Callback = function(v) WallbangAttemptEnabled = v end;
+        })
+        Sections.aimbot:Slider({
+            Name = "hostile inmate threat range"; Flag = "aggrorange";
+            Min = 10; Max = 300; Default = 80; Decimals = 1;
+            Callback = function(v) AggroThreatRange = v end;
+        })
+        Sections.aimbot:Toggle({
             Name = "team priority (aim / visuals)"; Flag = "priorityteamcheck";
             Default = true; Callback = function(v) PriorityTeamCheck = v end;
         })
@@ -944,6 +1441,7 @@ do -- combat
             Default = false;
             Callback = function(v)
                 RageBotEnabled = v;
+                AimState.Ragebot = v;
             end 
         })
 
@@ -1875,6 +2373,7 @@ local function ResolverSetupPlayer(player)
 
     ResolverPlayers[player] = {
         LastPosition = nil,
+        LastCharacter = nil,
         LastUpdate = os.clock(),
         Suspicion = 0,
         Speed = 0,
@@ -1887,7 +2386,7 @@ local function ResolverRemovePlayer(player)
     ResolverPlayers[player] = nil
 
     if ResolverRows[player] then
-        ResolverRows[player]:Destroy()
+        ResolverRows[player].Frame:Destroy()
         ResolverRows[player] = nil
     end
 end
@@ -1910,10 +2409,17 @@ local function ResolverAnalyzePlayer(player, data)
     if not root then
         data.Speed = 0
         data.Underground = false
+        data.LastPosition = nil
+        data.LastCharacter = nil
         return
     end
 
     local now = os.clock()
+    if data.LastCharacter ~= character or now - data.LastUpdate > 1.5 then
+        data.LastPosition = nil
+        data.LastCharacter = character
+        data.LastUpdate = now
+    end
     local position = root.Position
 
     data.Underground = position.Y < ResolverSettings.UndergroundY
@@ -2844,6 +3350,36 @@ Sections.visuals:Toggle({
             end
         })
 
+        Sections.visuals:Dropdown({
+            Name = 'tracer effect';
+            Items = { "Beam", "Trail", "Orb" };
+            Default = "Beam";
+            Callback = function(v)
+                TracerEffect = v;
+            end
+        })
+
+        Sections.visuals:Dropdown({
+            Name = 'tracer path';
+            Items = { "Straight", "Curved", "Lightning" };
+            Default = "Curved";
+            Callback = function(v)
+                TracerPath = v;
+            end
+        })
+
+        Sections.visuals:Slider({
+            Name = 'tracer speed (studs/sec)'; Flag = 'tracerspeed';
+            Min = 50; Max = 4000; Default = 900; Decimals = 10;
+            Callback = function(v) TracerSpeed = v end
+        })
+
+        Sections.visuals:Slider({
+            Name = 'tracer bend'; Flag = 'tracerbend';
+            Min = 0; Max = 2; Default = 0.75; Decimals = 0.05;
+            Callback = function(v) TracerBend = v end
+        })
+
         --[[Sections.visuals:Toggle({
             Name = 'no grass';
             Flag = 'nograss';
@@ -3043,6 +3579,56 @@ Players.LocalPlayer.CharacterAdded:Connect(function(character)
 end)
 
 
+    -- Proximity warning only; this cannot block a server-authorized arrest.
+    local arrestAlert = false
+    local arrestAlertRange = 24
+    local arrestGui = Instance.new("ScreenGui")
+    arrestGui.Name = "ArrestRiskWarning"
+    arrestGui.ResetOnSpawn = false
+    arrestGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+    local arrestText = Instance.new("TextLabel")
+    arrestText.Size = UDim2.fromOffset(300, 28)
+    arrestText.Position = UDim2.new(0.5, -150, 0, 155)
+    arrestText.BackgroundColor3 = Color3.fromRGB(75, 35, 42)
+    arrestText.TextColor3 = Color3.fromRGB(255, 200, 200)
+    arrestText.Font = Enum.Font.GothamBold
+    arrestText.TextSize = 12
+    arrestText.Visible = false
+    arrestText.Parent = arrestGui
+    Sections.movement:Toggle({
+        Name = "nearby guard warning"; Flag = "arrestwarning"; Default = false;
+        Callback = function(v) arrestAlert = v end;
+    })
+    Sections.movement:Slider({
+        Name = "guard warning range"; Flag = "arrestwarningrange";
+        Min = 5; Max = 100; Default = 24; Decimals = 1;
+        Callback = function(v) arrestAlertRange = v end;
+    })
+    local alertClock = 0
+    RunService.Heartbeat:Connect(function(dt)
+        alertClock += dt
+        if alertClock < 0.15 then return end
+        alertClock = 0
+        local role = TeamRole(LocalPlayer)
+        local ownRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        local nearest, nearestDistance = nil, arrestAlertRange
+        if arrestAlert and ownRoot and (role == "criminal" or role == "prisoner") then
+            for _, plr in ipairs(Players:GetPlayers()) do
+                local c = plr.Character
+                local r = c and c:FindFirstChild("HumanoidRootPart")
+                local hum = c and c:FindFirstChildOfClass("Humanoid")
+                if TeamRole(plr) == "police" and r and hum and hum.Health > 0 then
+                    local d = (r.Position - (ownRoot.Position - AAOffset())).Magnitude
+                    if d < nearestDistance then nearest, nearestDistance = plr, d end
+                end
+            end
+        end
+        arrestText.Visible = nearest ~= nil
+        if nearest then
+            arrestText.Text = string.format("Nearby guard: %s (%.0f studs)", nearest.DisplayName, nearestDistance)
+        end
+    end)
+
     --#region speed hack
 
         local speedhackconnection = RunService.Heartbeat:Connect(function(delta)
@@ -3152,6 +3738,7 @@ do
         Square = true,
         Prism = false,
         Underground = false,
+        SafeFooting = true,
         Range = 4,
         Height = 4,
         UndergroundDepth = 20,
@@ -3159,6 +3746,7 @@ do
     }
     local appliedRoot = nil
     local appliedOffset = Vector3.zero
+    local appliedRotation = CFrame.new()
     local phase = 0
     local pausedUntil = 0
     local promptHeld = false
@@ -3166,11 +3754,12 @@ do
     local renderKey = "AdvancedAA_Restore_" .. tostring(LocalPlayer.UserId)
 
     local function restoreOffset()
-        local oldRoot, offset = appliedRoot, appliedOffset
+        local oldRoot, offset, rotation = appliedRoot, appliedOffset, appliedRotation
         appliedRoot = nil
         appliedOffset = Vector3.zero
-        if oldRoot and oldRoot.Parent and offset.Magnitude > 0 then
-            oldRoot.CFrame = oldRoot.CFrame - offset
+        appliedRotation = CFrame.new()
+        if oldRoot and oldRoot.Parent then
+            oldRoot.CFrame = (oldRoot.CFrame - offset) * rotation:Inverse()
         end
     end
 
@@ -3180,6 +3769,12 @@ do
     end
     env.AdvancedAAPause = pauseAA
     env.AdvancedAAOffset = function() return appliedOffset end
+    env.AdvancedAAUnshiftPosition = function(position)
+        if not appliedRoot or not appliedRoot.Parent then return position end
+        local displacedRoot = appliedRoot.CFrame
+        local realRoot = (displacedRoot - appliedOffset) * appliedRotation:Inverse()
+        return realRoot:PointToWorldSpace(displacedRoot:PointToObjectSpace(position))
+    end
 
     -- Pause while interacting so pickup distance checks see the undisplaced
     -- character. Mouse clicks only pause for objects with a ClickDetector.
@@ -3233,7 +3828,10 @@ do
         if settings.Prism then
             height = (1 - math.abs(2 * ((t * 0.5) % 1) - 1)) * settings.Height
         end
-        if settings.Underground then height -= settings.UndergroundDepth end
+        if settings.Underground then
+            -- Clamp the combined prism/UG offset so it remains underground.
+            height = -math.clamp(settings.UndergroundDepth - height, 1, 25)
+        end
         return horizontal + Vector3.new(0, height, 0)
     end
 
@@ -3242,7 +3840,8 @@ do
     local function destroyVisual()
         local cam = workspace.CurrentCamera
         if cam and visual then
-            local hum = visualCharacter and visualCharacter:FindFirstChildOfClass("Humanoid")
+            local currentCharacter = LocalPlayer.Character
+            local hum = currentCharacter and currentCharacter:FindFirstChildOfClass("Humanoid")
             if hum and cam.CameraSubject and cam.CameraSubject:IsDescendantOf(visual) then
                 cam.CameraSubject = hum
             end
@@ -3290,18 +3889,46 @@ do
         if hum then
             hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
             local cam = workspace.CurrentCamera
-            if cam then cam.CameraSubject = hum end
+            local realHum = character:FindFirstChildOfClass("Humanoid")
+            if cam and (cam.CameraSubject == realHum or cam.CameraSubject == nil) then
+                cam.CameraSubject = hum
+            end
         end
     end
     local function renderVisual()
+        -- Grounded mode returns the actual character to its simulated position
+        -- before rendering. This may prevent UG from replicating to the server.
+        if settings.Underground and settings.SafeFooting then
+            restoreOffset()
+            destroyVisual()
+            return
+        end
         local character = LocalPlayer.Character
         if not settings.Enabled or not character then destroyVisual(); return end
+        local realHum = character:FindFirstChildOfClass("Humanoid")
+        local root = character:FindFirstChild("HumanoidRootPart")
+        if not realHum or realHum.Health <= 0 or not root then
+            destroyVisual()
+            return
+        end
         if visualCharacter ~= character or not visual then makeVisual(character) end
         if not visual then return end
+        -- Roblox can reset the camera subject after CharacterAdded.
+        local camera = workspace.CurrentCamera
+        local cloneHum = visual:FindFirstChildOfClass("Humanoid")
+        if camera and cloneHum and camera.CameraSubject == realHum then
+            camera.CameraSubject = cloneHum
+        end
         for _, pair in ipairs(pairsList) do
             local copy, original = pair[1], pair[2]
             if copy.Parent and original.Parent then
-                copy.CFrame = original.CFrame - appliedOffset
+                if appliedRoot and appliedRoot.Parent then
+                    local displaced = appliedRoot.CFrame
+                    local real = (displaced - appliedOffset) * appliedRotation:Inverse()
+                    copy.CFrame = real * displaced:ToObjectSpace(original.CFrame)
+                else
+                    copy.CFrame = original.CFrame
+                end
                 if savedTransparency[original] == nil then
                     savedTransparency[original] = original.LocalTransparencyModifier
                 end
@@ -3320,9 +3947,11 @@ do
         if not root or not humanoid or humanoid.Health <= 0 then return end
         phase = (phase + math.min(dt, 0.1) * settings.Speed) % 2
         local offset = calculateOffset(phase)
+        local rotation = settings.Underground and CFrame.Angles(0, 0, math.rad(90)) or CFrame.new()
         appliedRoot = root
         appliedOffset = offset
-        root.CFrame = root.CFrame + offset
+        appliedRotation = rotation
+        root.CFrame = (root.CFrame * rotation) + offset
     end))
 
     -- Keep the displacement through rendering to give replication a chance;
@@ -3346,6 +3975,19 @@ do
         Callback = function(value) settings.Prism = value end })
     section:Toggle({ Name = "underground", Flag = "advanced_aa_underground", Default = false,
         Callback = function(value) settings.Underground = value end })
+    section:Toggle({ Name = "failsafe", Flag = "failsafe", Default = true,
+        Callback = function(value)
+            FailsafeEnabled = value
+            if not value then FailsafeMissStreak = 0 end
+        end })
+    section:Slider({ Name = "failsafe after misses", Flag = "failsafeattempts",
+        Min = 1, Max = 8, Default = 3, Decimals = 1,
+        Callback = function(value) FailsafeAttempts = value end })
+    section:Toggle({ Name = "ug safe footing", Flag = "advanced_aa_safefooting", Default = true,
+        Callback = function(value)
+            settings.SafeFooting = value
+            if value then restoreOffset() end
+        end })
     section:Slider({
         Name = "aa range (studs)", Flag = "advanced_aa_range",
         Min = 0, Max = 30, Default = 4, Decimals = 1,
@@ -3358,7 +4000,7 @@ do
     })
     section:Slider({
         Name = "underground depth (studs)", Flag = "advanced_aa_ug_depth",
-        Min = 20, Max = 40, Default = 20, Decimals = 1,
+        Min = 1, Max = 25, Default = 20, Decimals = 1,
         Callback = function(value) settings.UndergroundDepth = value end,
     })
     section:Slider({
@@ -3376,7 +4018,103 @@ do
         table.clear(connections)
         if env.AdvancedAAPause == pauseAA then env.AdvancedAAPause = nil end
         env.AdvancedAAOffset = nil
+        env.AdvancedAAUnshiftPosition = nil
     end
 end
+
+
+    --#region hitbox expander
+    -- Widens the surface the aim code samples around each target and draws a
+    -- smooth translucent hull that follows chams. It does not change server
+    -- hitboxes; only our own sampling and visuals are affected.
+    do
+        local HullFolder = Instance.new("Folder")
+        HullFolder.Name = "HitboxExpanderHulls"
+        local hulls = {}
+
+        local function destroyHull(player)
+            local hull = hulls[player]
+            if hull then hull:Destroy(); hulls[player] = nil end
+        end
+
+        local function clearHulls()
+            for player in pairs(hulls) do destroyHull(player) end
+            HullFolder.Parent = nil
+        end
+
+        Sections.visuals:Toggle({
+            Name = "hitbox expander"; Flag = "hitboxexpander"; Default = false;
+            Callback = function(v)
+                HitboxExpander.Enabled = v
+                if not v then clearHulls() end
+            end
+        })
+        Sections.visuals:Slider({
+            Name = "expander size (studs)"; Flag = "hitboxexpandsize";
+            Min = 0.5; Max = 8; Default = 1.5; Decimals = 1;
+            Callback = function(v) HitboxExpander.Size = v end
+        })
+        Sections.visuals:Slider({
+            Name = "expander samples"; Flag = "hitboxexpandsamples";
+            Min = 4; Max = 64; Default = 12; Decimals = 1;
+            Callback = function(v) HitboxExpander.Samples = v end
+        })
+        Sections.visuals:Toggle({
+            Name = "expander visual"; Flag = "hitboxexpandvisual"; Default = true;
+            Callback = function(v)
+                HitboxExpander.Visual = v
+                if not v then clearHulls() end
+            end
+        })
+        Sections.visuals:Label({Name = "expander color"}):Colorpicker({
+            Default = Color3.fromRGB(120, 190, 255);
+            Callback = function(v) HitboxExpander.Color = v end
+        })
+
+        RunService.RenderStepped:Connect(function(dt)
+            local follow = 1 - math.exp(-14 * math.clamp(dt or 0.016, 0, 0.1))
+            if not (HitboxExpander.Enabled and HitboxExpander.Visual) then
+                if next(hulls) then clearHulls() end
+                return
+            end
+            if HullFolder.Parent ~= workspace then HullFolder.Parent = workspace end
+            local seen = {}
+            for _, plr in ipairs(Players:GetPlayers()) do
+                if plr ~= LocalPlayer and TargetPriority(plr) then
+                    local character = plr.Character
+                    local body = character and (character:FindFirstChild("UpperTorso")
+                        or character:FindFirstChild("Torso")
+                        or character:FindFirstChild("HumanoidRootPart"))
+                    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+                    if body and humanoid and humanoid.Health > 0 then
+                        seen[plr] = true
+                        local hull = hulls[plr]
+                        if not hull or not hull.Parent then
+                            hull = Instance.new("Part")
+                            hull.Name = "HitboxHull_" .. plr.Name
+                            hull.Anchored, hull.CanCollide, hull.CanQuery = true, false, false
+                            hull.Massless = true
+                            hull.Material = Enum.Material.ForceField
+                            hull.CastShadow = false
+                            hull.Parent = HullFolder
+                            hulls[plr] = hull
+                        end
+                        local expand = math.max(HitboxExpander.Size, 0)
+                        local goalCFrame = CFrame.new(body.Position) * (body.CFrame - body.CFrame.Position)
+                        local goalSize = Vector3.new(body.Size.X + expand * 2, body.Size.Y + expand * 2, body.Size.Z + expand * 2)
+                        -- Smooth follow so the hull glides between frames.
+                        hull.CFrame = hull.CFrame:Lerp(goalCFrame, follow)
+                        hull.Size = hull.Size:Lerp(goalSize, follow)
+                        hull.Color = HitboxExpander.Color
+                        hull.Transparency = HitboxExpander.Transparency
+                    end
+                end
+            end
+            for plr in pairs(hulls) do
+                if not seen[plr] then destroyHull(plr) end
+            end
+        end)
+    end
+    --#endregion
 
 Window:InitWindow()
