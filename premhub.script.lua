@@ -25,15 +25,15 @@
 
     local Camera = workspace.CurrentCamera
     local UserInputService = game:GetService("UserInputService")
-    local Players = game.Players 
+    local Players = game:GetService("Players") 
     local LocalPlayer = Players.LocalPlayer 
     local ReplicatedStorage = game:GetService("ReplicatedStorage")
     local RunService = game:GetService("RunService")
     local Lighting = game:GetService("Lighting")
-    local Teams = game:GetService("Teams")
+    local _Teams = game:GetService("Teams")
     local SoundService = game:GetService("SoundService")
 
-    local Modules = { -- Modules.
+    local _Modules = { -- Modules.
 
     };
 
@@ -41,7 +41,7 @@
         ShootEvent = ReplicatedStorage.GunRemotes.ShootEvent;
     };
 
-    local cheatinfo = {
+    local _cheatinfo = {
         autofireconnection = nil;
         offset = Vector3.new(0, 0, 0);
         didmanip = false;
@@ -222,11 +222,15 @@
 
 
 --#region library setup
-    --local amity = loadstring(game:HttpGet('https://raw.githubusercontent.com/78n/Roblox/refs/heads/main/Lua/Libraries/DataToCode/DataToCode.luau'))()
+    --local amity = loadstring((game :: any):HttpGet('https://raw.githubusercontent.com/78n/Roblox/refs/heads/main/Lua/Libraries/DataToCode/DataToCode.luau'))()
 
-    local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/skekkstunsua-lgtm/von/refs/heads/main/BullshitLib.lua"))()
+    local LibraryChunk = loadstring((game :: any):HttpGet("https://raw.githubusercontent.com/skekkstunsua-lgtm/von/refs/heads/main/BullshitLib.lua"))
+    if not LibraryChunk then error("negrohax: could not load the UI library") end
+    local Library = LibraryChunk()
     
-    local EspLib = loadstring(game:HttpGet('https://github.com/skekkstunsua-lgtm/von/raw/refs/heads/main/EspLib.lua'))()
+    local EspLibChunk = loadstring((game :: any):HttpGet('https://github.com/skekkstunsua-lgtm/von/raw/refs/heads/main/EspLib.lua'))
+    if not EspLibChunk then error("negrohax: could not load the ESP library") end
+    local EspLib = EspLibChunk()
 
     local Window = Library:Window({
         Name = 'negrohaxprism<font color="rgb(126, 192, 255)">.cc</font> | developer  | lifetime',
@@ -234,12 +238,12 @@
     }) 
 
     do
-        local Watermark = Window:Watermark({
+        local _Watermark = Window:Watermark({
             Name = "negrohax.cc",
             SubName = "negrohax.cc"
         })
 
-        local KeybindList = Window:KeybindList({
+        local _KeybindList = Window:KeybindList({
             Name = 'hot<font color="rgb(126, 192, 255)">keys</font>'
         })
     end
@@ -301,12 +305,26 @@ end
 
 local PriorityTeamCheck = true
 local AggroThreatRange = 80
+-- Role from the team name, memoised per Team instance: this runs several times
+-- per player per frame across the aim, ESP and chams code.
+local teamRoleCache = setmetatable({}, { __mode = "k" })
 local function TeamRole(player)
-    local name = player.Team and string.lower(player.Team.Name) or ""
-    if name:find("guard", 1, true) or name:find("police", 1, true) then return "police" end
-    if name:find("crim", 1, true) then return "criminal" end
-    if name:find("inmate", 1, true) or name:find("prisoner", 1, true) then return "prisoner" end
-    return "unknown"
+    local team = player and player.Team
+    if team then
+        local cached = teamRoleCache[team]
+        if cached then return cached end
+    end
+    local name = team and string.lower(team.Name) or ""
+    local role = "unknown"
+    if name:find("guard", 1, true) or name:find("police", 1, true) then
+        role = "police"
+    elseif name:find("crim", 1, true) then
+        role = "criminal"
+    elseif name:find("inmate", 1, true) or name:find("prisoner", 1, true) then
+        role = "prisoner"
+    end
+    if team then teamRoleCache[team] = role end
+    return role
 end
 local function TargetPriority(player)
     if not player or player == LocalPlayer then return nil end
@@ -330,12 +348,18 @@ end
 
 -- Guards must not target non-hostile or restrained prisoners. Prefer the
 -- game's Hostile attribute; textual icon fallback only applies if absent.
+-- The icon fallback walks the whole character with GetDescendants(), and this
+-- is asked for every prisoner on every aim/ESP/chams pass. Results are kept for
+-- a third of a second per character.
+local hostileCache = setmetatable({}, { __mode = "k" })
 local function IsHostilePrisoner(plr)
     local model = plr and plr.Character
     if not model then return false end
     if model:GetAttribute("Cuffed") == true or model:GetAttribute("Arrested") == true then
         return false
     end
+    local cached = hostileCache[model]
+    if cached and os.clock() - cached.time < 0.33 then return cached.value end
     local angryIcon, cuffIcon = false, false
     for _, obj in ipairs(model:GetDescendants()) do
         if obj:IsA("TextLabel") or obj:IsA("TextButton") then
@@ -350,10 +374,19 @@ local function IsHostilePrisoner(plr)
             end
         end
     end
-    if cuffIcon then return false end
-    local hostile = model:GetAttribute("Hostile")
-    if hostile ~= nil then return hostile == true end
-    return angryIcon
+    local result
+    if cuffIcon then
+        result = false
+    else
+        local hostile = model:GetAttribute("Hostile")
+        if hostile ~= nil then
+            result = hostile == true
+        else
+            result = angryIcon
+        end
+    end
+    hostileCache[model] = { value = result, time = os.clock() }
+    return result
 end
 
 -- Combat-only priority; visual filtering remains independent.
@@ -394,22 +427,142 @@ local function AARealPartPosition(part)
     return part.Position - AAOffset()
 end
 
+-- Pose the server currently believes we are in. While UG/AA displaces the
+-- character this is the displaced pose, and it is exactly what a shot origin
+-- has to match or the server drops the shot.
+local function AAServerPartPosition(part)
+    local env = (type(getgenv) == "function" and getgenv()) or _G
+    if type(env.AdvancedAAServerPosition) == "function" then
+        local ok, position = pcall(env.AdvancedAAServerPosition, part.Position)
+        if ok and typeof(position) == "Vector3" then return position end
+    end
+    return part.Position
+end
+
+-- How far we are currently displaced (0 = synced).
+local function AADesync()
+    local env = (type(getgenv) == "function" and getgenv()) or _G
+    if type(env.AdvancedAADesync) == "function" then
+        local ok, value = pcall(env.AdvancedAADesync)
+        if ok and type(value) == "number" then return value end
+    end
+    return 0
+end
+
+-- enabled / current displacement, for the panel readout.
+local function AAStatus()
+    local env = (type(getgenv) == "function" and getgenv()) or _G
+    if type(env.AdvancedAAStatus) == "function" then
+        local ok, enabled, offset = pcall(env.AdvancedAAStatus)
+        if ok then return enabled == true, tonumber(offset) or 0 end
+    end
+    return false, 0
+end
+
+-- Drop AA entirely for a few seconds. This is the failsafe path and the ONLY
+-- thing that interrupts UG mid-fight: no offset at all means every shot comes
+-- from the real pose. There is no per-shot sync any more.
+local function AAForceSync(seconds)
+    local env = (type(getgenv) == "function" and getgenv()) or _G
+    if type(env.AdvancedAAForceSync) == "function" then
+        pcall(env.AdvancedAAForceSync, seconds or 2)
+    end
+end
+
+-- Which pose the SERVER currently holds for us, with network lag included:
+--   "server"     UG has been on long enough that the server has the underground
+--                pose -> shots must come from the underground head.
+--   "real"       UG has been off long enough that the server has the real pose
+--                -> shots must come from the real head.
+--   "transition" the server is still catching up -> any shot fired now is an
+--                invalid (wrong origin), so the aim waits a few frames.
+local function AAShotState()
+    local env = (type(getgenv) == "function" and getgenv()) or _G
+    if type(env.AdvancedAAShotState) == "function" then
+        local ok, state = pcall(env.AdvancedAAShotState)
+        if ok and type(state) == "string" then return state end
+    end
+    return "real"
+end
+
+-- Shot peek: briefly hold the real pose so a shot the underground head cannot
+-- make is fired (and validated) from the real head instead. Returns false when
+-- peek is off or on cooldown.
+local function AAPeek(seconds)
+    local env = (type(getgenv) == "function" and getgenv()) or _G
+    if type(env.AdvancedAAPeek) == "function" then
+        local ok, granted = pcall(env.AdvancedAAPeek, seconds)
+        return ok and granted == true
+    end
+    return false
+end
+
+-- How long the server needs to receive a pose change (ping based).
+local function AASyncWindow()
+    local env = (type(getgenv) == "function" and getgenv()) or _G
+    if type(env.AdvancedAASyncWindow) == "function" then
+        local ok, value = pcall(env.AdvancedAASyncWindow)
+        if ok and type(value) == "number" then return value end
+    end
+    return 0.15
+end
+
+-- The origin a shot has to be built from. While displaced the server holds the
+-- displaced pose, so shooting from the "real" head is what produces invalid
+-- shots - which is why UG used to look like it never hit anything.
+local function ShotOrigin(head)
+    if not head then return nil end
+    if AADesync() > 0.25 then return AAServerPartPosition(head) end
+    return AARealPartPosition(head)
+end
+
 -- Rays must ignore the local AA visual copy: it sits at the real position and
 -- used to block our own silent-aim, hitscan and manipulation casts.
+--
+-- This used to scan workspace and allocate a new table for every single ray,
+-- which is the hottest path in the script (every scan sample, every probe, every
+-- frame of square/prism). The table is now reused and refreshed at most every
+-- 0.4s or when the character changes.
+local ignoreList, ignoreCharacter, ignoreTime = {}, nil, 0
 local function AAIgnoreList()
-    local list = {}
     local character = LocalPlayer.Character
-    if character then table.insert(list, character) end
-    for _, obj in ipairs(workspace:GetChildren()) do
-        if obj.Name == "AdvancedAALocalVisual" then table.insert(list, obj) end
+    local now = os.clock()
+    if ignoreCharacter == character and now - ignoreTime < 0.4 and ignoreList[1] == character then
+        return ignoreList
     end
-    return list
+    table.clear(ignoreList)
+    local count = 0
+    if character then
+        count = count + 1
+        ignoreList[count] = character
+    end
+    for _, obj in ipairs(workspace:GetChildren()) do
+        local name = obj.Name
+        if name == "AdvancedAALocalVisual" or name == "WallPenFX"
+            or name == "HitboxExpanderHulls" or name == "LatencyGhost" then
+            count = count + 1
+            ignoreList[count] = obj
+        end
+    end
+    ignoreCharacter, ignoreTime = character, now
+    return ignoreList
 end
+
+-- Body parts sampled by the aim. Hoisted out of EvaluateShot, which used to
+-- rebuild this literal array on every call (every player, every frame).
+local RIG_PART_NAMES = { "Head", "UpperTorso", "Torso", "LowerTorso",
+    "LeftUpperArm", "RightUpperArm", "Left Arm", "Right Arm",
+    "Left Leg", "Right Leg" }
 
 -- Shared with the aim, tracer and visual code below.
 local HitboxExpander = { Enabled = false, Size = 1.5, Visual = true, Samples = 12,
     Color = Color3.fromRGB(120, 190, 255), Transparency = 0.8,
     State = {}, Cache = {} }
+
+-- One RaycastParams object for every hull probe instead of a fresh one per call.
+local hbeParams = RaycastParams.new()
+hbeParams.FilterType = Enum.RaycastFilterType.Exclude
+hbeParams.IgnoreWater = true
 
 -- Samples the expanded hull around a target and returns the first point that
 -- has a clear line back to the origin. Visible hull means "try to shoot".
@@ -423,8 +576,7 @@ function HitboxExpander.Probe(player, origin)
     local now = os.clock()
     local cached = HitboxExpander.Cache[player]
     if cached and now - cached.time < 0.08 then return cached.point, cached.part end
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
+    local params = hbeParams
     params.FilterDescendantsInstances = AAIgnoreList()
     local radius = math.max(HitboxExpander.Size, 0.05)
     local count = math.clamp(math.floor(HitboxExpander.Samples), 4, 64)
@@ -451,16 +603,259 @@ function HitboxExpander.Probe(player, origin)
     return bestPoint, bestPart
 end
 
--- Written by the aim toggles so the panel can show readiness even with no target.
-local AimState = { Silent = false, Ragebot = false, Origin = nil }
-
-local function PauseAAForAction(seconds)
-    local env = (type(getgenv) == "function" and getgenv()) or _G
-    if type(env.AdvancedAAPause) == "function" then
-        env.AdvancedAAPause(seconds or 0.2)
-    end
+--#region wall penetration (local prediction only)
+-- Replaces the old one-ray check. The old check measured from the target point
+-- back to the wall's inner face, so it reported the distance to the wall
+-- instead of the wall's own thickness, could not describe a two-part wall at
+-- all (it demanded the entry and exit hit be the *same* part), and treated any
+-- thin decoration that the ray touched as infinitely thick cover.
+--
+-- This walks the ray from the muzzle to the shot point and adds up every solid
+-- span it has to cross: wall thickness per layer, layer count, and the exact
+-- entry/exit faces. Local prediction only - the server still validates shots,
+-- so this decides *when it is worth trying*, and aims at the point that has
+-- the least cover in front of it.
+-- setmetatable with __mode returns a weak-table type that Studio's checker will
+-- not accept as a plain table literal field, so the weakening happens here and
+-- the field itself stays a normal table.
+local function WeakKeyedTable()
+    return setmetatable({}, { __mode = "k" })
 end
 
+local WallPen = {
+    Enabled = false,
+    ShowMarker = true,
+    -- Derived from the single budget slider below (percent of the full budget).
+    Budget = 25,
+    MaxThickness = 1.25,
+    MaxLayers = 2,
+    -- Panel readout of the most recent measurement.
+    Last = { label = "idle", thickness = 0, layers = 0, time = 0 },
+    -- Written at runtime; declared here so the type checker knows the keys.
+    BackoffUntil = 0,
+    _markerTime = 0,
+    Cache = WeakKeyedTable(),
+}
+
+local WALLPEN_MIN_SPAN = 0.02
+local WALLPEN_FULL_THICKNESS = 5
+local WALLPEN_FULL_LAYERS = 6
+
+-- One slider owns both limits so the layer budget can never sit above what the
+-- thickness budget allows: 25% = 1.25 studs / 2 layers, 100% = 5 studs / 6.
+function WallPen.ApplyBudget(percent)
+    local value = tonumber(percent) or 25
+    local fraction = math.clamp(value / 100, 0.01, 1)
+    WallPen.Budget = value
+    WallPen.MaxThickness = WALLPEN_FULL_THICKNESS * fraction
+    WallPen.MaxLayers = math.max(1, math.ceil(WALLPEN_FULL_LAYERS * fraction))
+    table.clear(WallPen.Cache)
+    return WallPen.MaxThickness, WallPen.MaxLayers
+end
+
+WallPen.ApplyBudget(25)
+
+local wallPenParams = RaycastParams.new()
+wallPenParams.FilterType = Enum.RaycastFilterType.Exclude
+wallPenParams.IgnoreWater = true
+pcall(function() wallPenParams.CollisionGroup = "ClientBullet" end)
+
+-- The ignore list is a workspace scan, so it is shared for a few frames instead
+-- of being rebuilt for every single probe.
+local wallIgnore, wallIgnoreTime = nil, 0
+local function WallParams()
+    local now = os.clock()
+    if not wallIgnore or now - wallIgnoreTime > 0.4 then
+        wallIgnore = AAIgnoreList()
+        wallIgnoreTime = now
+        wallPenParams.FilterDescendantsInstances = wallIgnore
+    end
+    return wallPenParams
+end
+
+-- Cover is something a bullet is actually stopped by. Decals, non-colliding
+-- props and nearly invisible helpers are stepped through instead of being
+-- counted as a 100 stud wall, which is what silently killed wallpen before.
+local function IsCover(part)
+    if not part or not part:IsA("BasePart") then return false end
+    if not part.CanCollide then return false end
+    if part.Transparency >= 0.9 then return false end
+    return true
+end
+
+-- Distance from `from` to the face where the ray leaves `part`, from a slab
+-- test in the part's own space. nil means "not measurable" (terrain, mesh
+-- hulls), and the caller refuses to claim penetration through those instead of
+-- inventing a number.
+local function ExitDistance(part, from, unit)
+    if part:IsA("Terrain") then return nil end
+    local ok, cf, size = pcall(function() return part.CFrame, part.Size end)
+    if not ok or not cf or not size then return nil end
+    local origin = cf:PointToObjectSpace(from)
+    local dir = cf:VectorToObjectSpace(unit)
+    local half = size * 0.5
+    local enter, leave = -math.huge, math.huge
+    for _, key in ipairs({ "X", "Y", "Z" }) do
+        local o, d, h = origin[key], dir[key], half[key]
+        if math.abs(d) < 1e-6 then
+            if math.abs(o) > h + 1e-3 then return nil end
+        else
+            local t1, t2 = (-h - o) / d, (h - o) / d
+            if t1 > t2 then t1, t2 = t2, t1 end
+            if t1 > enter then enter = t1 end
+            if t2 < leave then leave = t2 end
+            if enter > leave then return nil end
+        end
+    end
+    if leave <= 0 then return nil end
+    local span = leave - math.max(enter, 0)
+    return math.max(span, WALLPEN_MIN_SPAN)
+end
+
+-- Walks origin -> point and returns:
+--   state     "clear" (unobstructed line to the target)
+--             "blocked" (measurable cover in front of the target)
+--             "miss"    (the ray never reached the target at all)
+--   thickness total solid span crossed, in studs
+--   layers    how many separate solid spans that was
+--   entry/exit the faces of the first/last span (for the marker)
+function WallPen.Trace(origin, point, model)
+    local direction = point - origin
+    local distance = direction.Magnitude
+    if distance < 0.1 then
+        return { state = "miss", thickness = math.huge, layers = 0 }
+    end
+    local unit = direction / distance
+    local params = WallParams()
+
+    local cursor = origin
+    local thickness, layers = 0, 0
+    local entryPart, entryPos, exitPos, reachedPart
+    -- Two extra probes past the layer budget so an over-budget wall still gets
+    -- a real measured number instead of "unknown".
+    local guard = math.max(WallPen.MaxLayers, 1) + 2
+
+    for _ = 1, guard do
+        local toPoint = point - cursor
+        if toPoint.Magnitude < 0.06 then break end
+        local hit = workspace:Raycast(cursor, toPoint, params)
+        if not hit then break end
+        if model and hit.Instance:IsDescendantOf(model) then
+            reachedPart = hit.Instance
+            break
+        end
+
+        local part = hit.Instance
+        if IsCover(part) then
+            layers += 1
+            local span = ExitDistance(part, hit.Position, unit)
+            if not span then
+                -- Solid we cannot measure: never claim we can shoot through it.
+                return { state = "blocked", thickness = math.huge, layers = layers,
+                    part = part, entry = hit.Position, exit = hit.Position }
+            end
+            thickness += span
+            if not entryPart then
+                entryPart, entryPos = part, hit.Position
+            end
+            exitPos = hit.Position + unit * span
+            if thickness > WallPen.MaxThickness * 1.5 then
+                -- Far over budget: stop paying for rays, keep the measurement.
+                return { state = "blocked", thickness = thickness, layers = layers,
+                    part = entryPart, entry = entryPos, exit = exitPos }
+            end
+            -- Step just past the exit face so the next cast sees the next layer.
+            cursor = exitPos + unit * 0.02
+        else
+            -- Decoration / non-solid: look straight past it.
+            cursor = hit.Position + unit * 0.02
+        end
+    end
+
+    if layers == 0 then
+        if reachedPart then
+            return { state = "clear", thickness = 0, layers = 0, reached = reachedPart }
+        end
+        return { state = "miss", thickness = math.huge, layers = 0 }
+    end
+    return { state = "blocked", thickness = thickness, layers = layers,
+        part = entryPart, entry = entryPos, exit = exitPos, reached = reachedPart }
+end
+
+-- Same trace, cached briefly per target part: silent aim, the namecall rewrite
+-- and the ragebot all ask the same question inside one frame.
+function WallPen.Probe(part, origin, point, model)
+    -- Numeric comparison instead of building a format string for every probe:
+    -- the aim asks for the same handful of points many times per frame and the
+    -- old key allocation was showing up in the hot path.
+    local now = os.clock()
+    local cached = WallPen.Cache[part]
+    if cached and now - cached.time < 0.035
+        and math.abs(cached.ox - origin.X) < 0.15 and math.abs(cached.oy - origin.Y) < 0.15
+        and math.abs(cached.oz - origin.Z) < 0.15 and math.abs(cached.px - point.X) < 0.15
+        and math.abs(cached.py - point.Y) < 0.15 and math.abs(cached.pz - point.Z) < 0.15 then
+        return cached.result
+    end
+    local result = WallPen.Trace(origin, point, model)
+    WallPen.Cache[part] = { ox = origin.X, oy = origin.Y, oz = origin.Z,
+        px = point.X, py = point.Y, pz = point.Z, time = now, result = result }
+    return result
+end
+
+function WallPen.CanPenetrate(thickness, layers)
+    if not WallPen.Enabled then return false end
+    -- Set by the aim failsafe when shots stop registering: wallpen attempts are
+    -- the most likely cause, so quiet them down for a moment instead of
+    -- spamming rejected shots.
+    if os.clock() < (WallPen.BackoffUntil or 0) then return false end
+    if not thickness or thickness == math.huge then return false end
+    if thickness > WallPen.MaxThickness + 1e-3 then return false end
+    return (layers or 1) >= 1 and (layers or 1) <= WallPen.MaxLayers
+end
+
+-- A wallpen is worth less when it has to cross more material or more layers,
+-- so a 0.2 stud single wall always beats a 1.2 stud double wall.
+function WallPen.Cost(thickness, layers)
+    return (thickness or math.huge) + math.max((layers or 1) - 1, 0) * 0.15
+end
+
+-- Purely visual feedback: a rod through the wall between the entry and exit
+-- faces plus a dot on the face the bullet enters. CanQuery = false so it can
+-- never block our own traces.
+function WallPen.Marker(trace)
+    if not WallPen.ShowMarker or not trace or not trace.entry then return end
+    local now = os.clock()
+    if now - (WallPen._markerTime or 0) < 0.12 then return end
+    WallPen._markerTime = now
+    local entry = trace.entry
+    local exitPos = trace.exit or entry
+    local span = math.max((exitPos - entry).Magnitude, 0.06)
+    local rod = Instance.new("Part")
+    rod.Name = "WallPenFX"
+    rod.Anchored, rod.CanCollide, rod.CanQuery, rod.CanTouch = true, false, false, false
+    rod.Material = Enum.Material.Neon
+    rod.Color = Color3.fromRGB(255, 90, 120)
+    rod.Size = Vector3.new(0.09, 0.09, span)
+    rod.CFrame = CFrame.lookAt(entry:Lerp(exitPos, 0.5), exitPos)
+    rod.Parent = workspace
+    local dot = Instance.new("Part")
+    dot.Name = "WallPenFX"
+    dot.Anchored, dot.CanCollide, dot.CanQuery, dot.CanTouch = true, false, false, false
+    dot.Shape = Enum.PartType.Ball
+    dot.Material = Enum.Material.Neon
+    dot.Color = Color3.fromRGB(255, 200, 90)
+    dot.Size = Vector3.new(0.22, 0.22, 0.22)
+    dot.CFrame = CFrame.new(entry)
+    dot.Parent = workspace
+    task.delay(0.45, function()
+        if rod.Parent then rod:Destroy() end
+        if dot.Parent then dot:Destroy() end
+    end)
+end
+--#endregion
+
+-- Written by the aim toggles so the panel can show readiness even with no target.
+local AimState = { Silent = false, Ragebot = false, Origin = nil }
 
 -- Target panel. Resolver labels describe heuristics, not proof of cheating.
 do
@@ -471,7 +866,7 @@ do
     gui.ResetOnSpawn = false
     gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
     local box = Instance.new("Frame")
-    box.Size = UDim2.fromOffset(310, 158)
+    box.Size = UDim2.fromOffset(310, 186)
     box.Position = UDim2.new(0.5, -155, 0.7, 0)
     box.BackgroundColor3 = Color3.fromRGB(18, 20, 27)
     box.BorderSizePixel = 0
@@ -497,7 +892,7 @@ do
     avatar.BackgroundColor3 = Color3.fromRGB(31, 35, 45)
     local detail = Instance.new("TextLabel", box)
     detail.Position = UDim2.fromOffset(84, 30)
-    detail.Size = UDim2.new(1, -90, 0, 124)
+    detail.Size = UDim2.new(1, -90, 0, 152)
     detail.BackgroundTransparency = 1
     detail.Font = Enum.Font.Gotham
     detail.TextSize = 12
@@ -505,6 +900,7 @@ do
     detail.TextXAlignment = Enum.TextXAlignment.Left
     detail.TextYAlignment = Enum.TextYAlignment.Top
     local shown, lastAvatar = true, nil
+    local lastPanelUpdate = 0
     Sections.aimbot:Toggle({
         Name = "targeting panel", Flag = "targetingpanel", Default = true,
         Callback = function(value) shown = value end,
@@ -517,22 +913,17 @@ do
         local character = p and p.Character
         local head = character and character:FindFirstChild("Head")
         if head and origin then
-            local params = RaycastParams.new()
-            params.FilterType = Enum.RaycastFilterType.Exclude
-            params.FilterDescendantsInstances = AAIgnoreList()
-            local delta = head.Position - origin
-            local hit = workspace:Raycast(origin, delta * 1.01, params)
-            if not hit or hit.Instance:IsDescendantOf(character) then
+            -- Same tracer wallpen uses, so the panel and the aim always agree
+            -- on how much cover is actually in the way.
+            local trace = WallPen.Trace(origin, head.Position, character)
+            if trace.state == "clear" then
                 text = "Visibility: visible"
+            elseif trace.thickness == math.huge then
+                text = "Visibility: hidden (unmeasurable)"
+            elseif trace.layers > 0 then
+                text = string.format("Visibility: wall %.2f studs / %dL", trace.thickness, trace.layers)
             else
-                local back = workspace:Raycast(head.Position, -delta, params)
-                local thickness = back and back.Instance == hit.Instance
-                    and (head.Position - back.Position).Magnitude or math.huge
-                if thickness < math.huge then
-                    text = string.format("Visibility: wall %.2f", thickness)
-                else
-                    text = "Visibility: hidden"
-                end
+                text = "Visibility: hidden"
             end
         end
         visCache.player, visCache.time, visCache.text = p, now, text
@@ -551,6 +942,13 @@ do
         box.Visible = shown and (not not active or armed)
         if not box.Visible then return end
 
+        -- The panel is text, not a game render: updating it 20 times a second
+        -- instead of every frame removes a surprising amount of string work
+        -- from the render step and changes nothing you can see.
+        local panelNow = os.clock()
+        if panelNow - lastPanelUpdate < 0.05 then return end
+        lastPanelUpdate = panelNow
+
         local aimText = "Aim: off"
         if AimState.Silent and AimState.Ragebot then
             aimText = "Aim: silent + ragebot ready"
@@ -563,8 +961,9 @@ do
         if not active then
             lastAvatar = nil
             avatar.Image = ""
-            detail.Text = string.format("No target in view\n%s\nScan: idle | HBE: %s",
-                aimText, HitboxExpander.Enabled and "on" or "off")
+            detail.Text = string.format("No target in view\n%s\nScan: idle | HBE: %s | WP: %s",
+                aimText, HitboxExpander.Enabled and "on" or "off",
+                WallPen.Enabled and "on" or "off")
             return
         end
 
@@ -583,11 +982,34 @@ do
         end
         local origin = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Head")
         origin = origin and AARealPartPosition(origin) or nil
+        local aaOn, aaDisplace, aaHeld = AAStatus()
+        local aaText = "AA: off"
+        if aaOn then
+            if aaHeld then
+                aaText = "AA: dropped (failsafe)"
+            else
+                aaText = aaDisplace > 0.25
+                    and string.format("AA: displaced %.1f", aaDisplace) or "AA: synced"
+            end
+        end
+        local wpText = "WP: off"
+        if WallPen.Enabled then
+            local last = WallPen.Last
+            if last and os.clock() - last.time < 2 then
+                local value = last.thickness == math.huge and "unmeasurable"
+                    or string.format("%.2f studs", last.thickness or 0)
+                wpText = string.format("WP: %s / %dL  (max %.2f / %dL)",
+                    value, last.layers or 0, WallPen.MaxThickness, WallPen.MaxLayers)
+            else
+                wpText = string.format("WP: max %.2f studs / %dL",
+                    WallPen.MaxThickness, WallPen.MaxLayers)
+            end
+        end
         detail.Text = string.format(
-            "%s (@%s)\nHealth: %.0f / %.0f\nDistance: %.0f studs\n%s\n%s\n%s\nScan: %s | %s",
+            "%s (@%s)\nHealth: %.0f / %.0f\nDistance: %.0f studs\n%s\n%s\n%s\nScan: %s | %s\n%s\n%s",
             p.DisplayName, p.Name, h.Health, h.MaxHealth,
             (r.Position - (own.Position - AAOffset())).Magnitude, status,
-            visibilityText(p, origin), aimText, scanText, hbeText)
+            visibilityText(p, origin), aimText, scanText, hbeText, wpText, aaText)
         if lastAvatar ~= p.UserId then
             local id = p.UserId
             lastAvatar = id
@@ -604,27 +1026,58 @@ end
 
 do -- combat
     local SilentAimEnabled = false; 
-    local NoSpreadEnabled = false;
+    local _NoSpreadEnabled = false;
     local ManipEnabled = false;
     local Manips = 2;
+    local MaxAimCandidates = 8;
     local ManipScanCount = 120;
     local HitScanEnabled = false;
     local HitScanCount = 32;
-    local WallbangAttemptEnabled = false;
-    local WallbangMaxThickness = 1.25;
-    -- Failsafe: fire normally first, and only fall back to snapping the
-    -- character back (AA pause) after repeated shots fail to register.
+    -- Failsafe: the only thing allowed to interrupt UG. Shots are fired from
+    -- the pose the server holds; if a streak of them stops registering, the
+    -- displacement is dropped completely for a few seconds (plain valid shots
+    -- from the real pose) and wallpen rests. UG then returns on its own.
     local FailsafeEnabled = true;
     local FailsafeAttempts = 3;
+    -- How long UG pauses when the failsafe fires (slider: 0.10s - 8s).
+    local FailsafeSyncTime = 1;
     local FailsafeMissStreak = 0;
     local FailsafePending = false;
+    local FailsafeLastForce = 0;
 
     local function FailsafeReady()
         return FailsafeEnabled and FailsafeMissStreak >= FailsafeAttempts;
     end
 
+    -- Failsafe trigger now happens inside FailsafeWatch the moment the miss
+    -- limit is reached. Kept as a no-op so the shot paths still compile.
+    local function FailsafeApply() end
+
+    -- Published so the advanced-aa section (a later scope) can drive the
+    -- failsafe. Writing to `FailsafeEnabled` from there used to hit a global
+    -- with the same name while combat kept reading its own local, so the
+    -- toggles silently did nothing.
+    local aaEnv = (type(getgenv) == "function" and getgenv()) or _G
+    aaEnv.AdvancedAASetFailsafe = function(enabled, attempts, syncTime)
+        if type(enabled) == "boolean" then
+            FailsafeEnabled = enabled
+            if not enabled then FailsafeMissStreak = 0 end
+        end
+        if type(attempts) == "number" then
+            FailsafeAttempts = math.clamp(attempts, 1, 8)
+        end
+        if type(syncTime) == "number" then
+            FailsafeSyncTime = math.clamp(syncTime, 0.1, 8)
+        end
+    end
+
+    -- Failsafe: while UG is active, count shots that do no damage. When the
+    -- miss limit is reached, UG pauses for FailsafeSyncTime (1s) right away,
+    -- the streak resets, and UG comes back on its own. Misses while UG is
+    -- off or already paused are not counted.
     local function FailsafeWatch(targetPlayer)
         if not FailsafeEnabled or not targetPlayer or FailsafePending then return end
+        if AADesync() < 0.25 then return end -- UG not active: nothing to fail
         local character = targetPlayer.Character
         local humanoid = character and character:FindFirstChildOfClass("Humanoid")
         if not humanoid then return end
@@ -635,16 +1088,25 @@ do -- combat
             if not humanoid.Parent then return end
             if humanoid.Health < before then
                 FailsafeMissStreak = 0;
-            else
-                FailsafeMissStreak += 1;
+                return
+            end
+            -- UG got paused/disabled while waiting: do not count this one.
+            if AADesync() < 0.25 then return end
+            FailsafeMissStreak += 1;
+            if FailsafeMissStreak >= FailsafeAttempts
+                and os.clock() - FailsafeLastForce >= FailsafeSyncTime then
+                FailsafeMissStreak = 0;
+                FailsafeLastForce = os.clock();
+                WallPen.BackoffUntil = os.clock() + FailsafeSyncTime;
+                AAForceSync(FailsafeSyncTime);
             end
         end)
     end
-    local ScanProgress = 0;
-    local ScanStatus = "idle";
-    local NoRecoilEnabled = false;
+    local _ScanProgress = 0;
+    local _ScanStatus = "idle";
+    local _NoRecoilEnabled = false;
     local RageBotEnabled = false;
-    local SilentReload = false;
+    local _SilentReload = false;
     local FovCircleEnabled = false;
     local RapidFireEnabled = false;
     local FireRate = 0;
@@ -673,6 +1135,64 @@ do -- combat
                     travelled -= length
                 end
                 return path[#path]
+            end
+
+            -- Recycles tracer geometry. One curved tracer used to build 15-40
+            -- fresh instances per bullet and destroy them a second later; at
+            -- high fire rates that churn alone costs frames.
+            local tracerPartPool, tracerBeamPool = {}, {}
+            local tracerAttachments = setmetatable({}, { __mode = "k" })
+            local TRACER_POOL_LIMIT = 512
+
+            local function TakeTracerPart()
+                local part = table.remove(tracerPartPool)
+                if part then return part end
+                local new = Instance.new("Part")
+                new.Anchored, new.CanCollide, new.CanQuery = true, false, false
+                new.Size = Vector3.new(0.2, 0.2, 0.2)
+                new.Transparency = 1
+                return new
+            end
+            local function ReleaseTracerPart(part)
+                part.Parent = nil
+                if #tracerPartPool < TRACER_POOL_LIMIT then
+                    table.insert(tracerPartPool, part)
+                else
+                    part:Destroy()
+                end
+            end
+            local function TakeTracerBeam()
+                local beam = table.remove(tracerBeamPool)
+                if beam then return beam end
+                local new = Instance.new("Beam")
+                new.LightEmission, new.LightInfluence = 1, 0
+                new.FaceCamera = true
+                new.TextureMode = Enum.TextureMode.Wrap
+                return new
+            end
+            local function ReleaseTracerBeam(beam)
+                beam.Attachment0, beam.Attachment1 = nil, nil
+                beam.Parent = nil
+                if #tracerBeamPool < TRACER_POOL_LIMIT then
+                    table.insert(tracerBeamPool, beam)
+                else
+                    beam:Destroy()
+                end
+            end
+            -- Two attachment slots per pooled node, created once and reused.
+            local function TracerAttachment(part, slot)
+                local list = tracerAttachments[part]
+                if not list then
+                    list = {}
+                    tracerAttachments[part] = list
+                end
+                local attachment = list[slot]
+                if not attachment then
+                    attachment = Instance.new("Attachment")
+                    attachment.Parent = part
+                    list[slot] = attachment
+                end
+                return attachment
             end
 
             CreateTracer = function(origin, hitPoint, bendOffset)
@@ -739,7 +1259,9 @@ do -- combat
                     end
                     local anchor = control or (origin:Lerp(hitPoint, 0.5) + bend)
                     anchor += bend * 0.25
-                    local steps = math.clamp(math.floor((hitPoint - origin).Magnitude / 4), 6, 20)
+                    -- Fewer segments than before: the curve reads the same and
+                    -- every segment costs a part plus a beam.
+                    local steps = math.clamp(math.floor((hitPoint - origin).Magnitude / 6), 5, 14)
                     path = {}
                     for i = 0, steps do
                         local alpha = i / steps
@@ -753,13 +1275,10 @@ do -- combat
 
                 local nodes = {}
                 local function nodeAt(position)
-                    local node = Instance.new("Part")
-                    node.Anchored, node.CanCollide, node.CanQuery = true, false, false
-                    node.Transparency = 1
-                    node.Size = Vector3.new(0.2, 0.2, 0.2)
+                    local node = TakeTracerPart()
                     node.CFrame = CFrame.new(position)
                     node.Parent = workspace
-                    table.insert(nodes, node)
+                    nodes[#nodes + 1] = node
                     return node
                 end
 
@@ -771,9 +1290,9 @@ do -- combat
                     for i = 2, #path do
                         local current = nodeAt(path[i])
                         if (path[i] - path[i - 1]).Magnitude > 0.05 then
-                            local a0 = Instance.new("Attachment", previous)
-                            local a1 = Instance.new("Attachment", current)
-                            local beam = Instance.new("Beam")
+                            local a0 = TracerAttachment(previous, 1)
+                            local a1 = TracerAttachment(current, 2)
+                            local beam = TakeTracerBeam()
                             beam.Attachment0, beam.Attachment1 = a0, a1
                             beam.Texture = data.Texture
                             beam.Width0, beam.Width1 = data.Width0, data.Width1
@@ -800,7 +1319,7 @@ do -- combat
                     head.CFrame = CFrame.new(TracerEffect == "Orb" and origin or hitPoint)
                     head.Parent = workspace
                     if TracerEffect == "Trail" then
-                        local a0 = Instance.new("Attachment", nodes[1])
+                        local a0 = TracerAttachment(nodes[1], 3)
                         local a1 = Instance.new("Attachment", head)
                         trail = Instance.new("Trail")
                         trail.Attachment0, trail.Attachment1 = a0, a1
@@ -828,20 +1347,33 @@ do -- combat
                             task.wait()
                         end
                     end
+                    -- Fading every frame meant building a fresh NumberSequence
+                    -- for every beam every frame. 25Hz looks identical.
                     local fadeStart = os.clock()
-                    while os.clock() - fadeStart < lifetime do
-                        local progress = (os.clock() - fadeStart) / lifetime
-                        for _, beam in ipairs(beams) do
-                            if beam.Parent then
-                                beam.Transparency = NumberSequence.new(0.2 + 0.8 * progress)
+                    local lastFade = -1
+                    while true do
+                        local elapsed = os.clock() - fadeStart
+                        if elapsed >= lifetime then break end
+                        local progress = elapsed / lifetime
+                        if progress - lastFade >= 0.04 or lastFade < 0 then
+                            lastFade = progress
+                            local sequence = NumberSequence.new(0.2 + 0.8 * progress)
+                            for _, beam in ipairs(beams) do
+                                if beam.Parent then
+                                    beam.Transparency = sequence
+                                end
                             end
+                            if head and head.Parent then head.Transparency = progress end
                         end
-                        if head and head.Parent then head.Transparency = progress end
                         task.wait()
                     end
+                    if trail then trail:Destroy() end
                     if head and head.Parent then head:Destroy() end
+                    for _, beam in ipairs(beams) do
+                        ReleaseTracerBeam(beam)
+                    end
                     for _, node in ipairs(nodes) do
-                        if node.Parent then node:Destroy() end
+                        ReleaseTracerPart(node)
                     end
                 end)
             end
@@ -852,7 +1384,7 @@ do -- combat
     
     --#region manip 
 
-        local cachedoffset = nil
+        local _cachedoffset = nil
         --local lastShotTarget = nil
 
         autofireparams.FilterDescendantsInstances = AAIgnoreList()
@@ -881,11 +1413,12 @@ do -- combat
                 if hit and hit.Instance and hit.Instance:IsDescendantOf(target.Parent) then
                     return hit.Instance
                 end
+                return nil
             end
-            ScanProgress, ScanStatus = 0, "scanning"
+            _ScanProgress, _ScanStatus = 0, "scanning"
             if not ignorezeropos then
                 local hit = test(Vector3.zero)
-                if hit then ScanProgress, ScanStatus = 1, "direct"; return Vector3.zero, false, hit end
+                if hit then _ScanProgress, _ScanStatus = 1, "direct"; return Vector3.zero, false, hit end
             end
             local count = math.clamp(math.floor(ManipScanCount), 1, 500)
             local bestOffset, bestHit, bestLength = nil, nil, math.huge
@@ -902,9 +1435,9 @@ do -- combat
                 if hit and length < bestLength then
                     bestOffset, bestHit, bestLength = offset, hit, length
                 end
-                ScanProgress = i / count
+                _ScanProgress = i / count
             end
-            ScanStatus = bestOffset and "found" or "no path"
+            _ScanStatus = bestOffset and "found" or "no path"
             return bestOffset, bestOffset ~= nil, bestHit
         end
 
@@ -920,7 +1453,7 @@ do -- combat
         FovCircle.Color = Color3.fromRGB(255, 255, 255)
         FovCircle.Visible = false
 
-        local fovconnection = RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function()
+        local _fovconnection = RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function()
             if FovCircleEnabled then 
                 FovCircle.Position = UserInputService:GetMouseLocation()
             end
@@ -958,162 +1491,226 @@ do -- combat
         local gameReload = filtergc("function", {Name = "reload", Constants = {"ReloadSound"}}, true)
 
         -- Fibonacci surface sampling searches visible points on body parts.
-        -- A blocked ray is only a wallbang *candidate*: Roblox/game server
-        -- validation determines whether any through-wall shot is accepted.
+        -- Every sample is measured by WallPen, so "blocked" now means a real,
+        -- measurable amount of cover instead of "something got in the way".
         local function EvaluateShot(target, origin)
             if not target or not target.Parent then return nil end
+            if typeof(origin) ~= "Vector3" then return nil end
             local model = target:FindFirstAncestorOfClass("Model")
             if not model then return nil end
             local plr = Players:GetPlayerFromCharacter(model)
             local function report(label)
                 if plr then ShotScanResults[plr] = {label = label, time = os.clock()} end
             end
-            local params = RaycastParams.new()
-            params.FilterType = Enum.RaycastFilterType.Exclude
-            params.FilterDescendantsInstances = AAIgnoreList()
+            local function plan(part, point, quality, label, offset)
+                report(label)
+                return {FinalPart = part, point = point, offset = offset or Vector3.zero, quality = quality}
+            end
 
-            -- Wall thickness along one sample ray. nil means the ray never
-            -- reached the target, math.huge means it hit too much geometry.
-            local function measure(point)
-                local direction = point - origin
-                if direction.Magnitude < 0.001 then return "miss", nil, math.huge end
-                local hit = workspace:Raycast(origin, direction * 1.01, params)
-                if hit and hit.Instance:IsDescendantOf(model) then return "clear", hit, 0 end
-                if not hit then return "miss", nil, math.huge end
-                local back = workspace:Raycast(point, -direction, params)
-                if back and back.Instance == hit.Instance then
-                    return "blocked", hit, (point - back.Position).Magnitude
+            -- 1. Direct line to the head (or whatever the caller asked for).
+            local direct = WallPen.Probe(target, origin, target.Position, model)
+            if direct.state == "clear" then
+                return plan(direct.reached or target, target.Position, 1, "Direct: clear")
+            end
+
+            -- Thinnest cover found so far, used by the wallpen step below.
+            local bestWall
+            local function considerWall(part, point, trace)
+                if not trace or trace.layers <= 0 or trace.thickness == math.huge then return end
+                local cost = WallPen.Cost(trace.thickness, trace.layers)
+                if not bestWall or cost < bestWall.cost then
+                    bestWall = {part = part, point = point, trace = trace, cost = cost}
                 end
-                return "blocked", hit, math.huge
             end
+            considerWall(target, target.Position, direct)
 
-            -- Direct line to the head first: a through-wall shot should stay on
-            -- that line instead of being pushed sideways around the obstacle.
-            local state, _, directThickness = measure(target.Position)
-            if state == "clear" then
-                report("Direct: clear")
-                return {FinalPart = target, point = target.Position, offset = Vector3.zero, quality = 1}
-            end
-            local blockedThickness = directThickness
-
-            -- The expander says the target is reachable: fire at that hull point.
+            -- 2. Expanded hull: cheapest way to turn a graze into a hit.
             if HitboxExpander.Enabled and plr then
                 local hbePoint, hbePart = HitboxExpander.Probe(plr, origin)
                 if hbePoint and hbePart then
-                    report("HBE: visible")
-                    return {FinalPart = hbePart, point = hbePoint, offset = Vector3.zero, quality = 1.2}
+                    return plan(hbePart, hbePoint, 1.2, "HBE: visible")
                 end
             end
 
-            local parts = {target}
-            if HitScanEnabled or HitboxExpander.Enabled then
-                for _, name in ipairs({"UpperTorso", "Torso", "LowerTorso", "LeftUpperArm", "RightUpperArm", "Left Arm", "Right Arm", "Left Leg", "Right Leg"}) do
+            -- 3. Sample the rest of the rig: clear samples win, blocked ones feed
+            --    the wallpen decision.
+            local parts = { target }
+            local scanBody = HitScanEnabled or HitboxExpander.Enabled or WallPen.Enabled
+            if scanBody then
+                for _, name in ipairs(RIG_PART_NAMES) do
                     local part = model:FindFirstChild(name)
-                    if part and part:IsA("BasePart") and part ~= target then table.insert(parts, part) end
+                    if part and part:IsA("BasePart") and part ~= target then
+                        table.insert(parts, part)
+                    end
                 end
             end
-            local expand = HitboxExpander.Enabled and math.max(HitboxExpander.Size, 0) or 0
-            local count = HitScanEnabled and math.clamp(math.floor(HitScanCount), 1, 200) or 1
+            -- With hitscan off, wallpen still needs one ray per body part, so the
+            -- ray budget never drops below the number of parts being examined.
+            local count = HitScanEnabled
+                and math.clamp(math.floor(HitScanCount), 1, 200)
+                or (scanBody and math.max(#parts, 1) or 1)
             local golden = math.pi * (3 - math.sqrt(5))
+            local expand = HitboxExpander.Enabled and math.max(HitboxExpander.Size, 0) or 0
             for i = 1, count do
                 local part = parts[((i - 1) % #parts) + 1]
                 local point = part.Position
-                if i > 1 or expand > 0 then
+                if i > #parts then
+                    -- Extra hitscan samples: surface points (with the expander
+                    -- radius applied when it is on).
                     local y = 1 - 2 * ((i - 0.5) / math.max(count, 1))
                     local radial = math.sqrt(math.max(0, 1 - y * y))
                     local angle = i * golden
                     local unit = Vector3.new(math.cos(angle) * radial, y, math.sin(angle) * radial)
                     local half = part.Size * 0.42 + Vector3.new(expand, expand, expand)
-                    point = part.CFrame:PointToWorldSpace(Vector3.new(unit.X * half.X, unit.Y * half.Y, unit.Z * half.Z))
+                    point = part.CFrame:PointToWorldSpace(
+                        Vector3.new(unit.X * half.X, unit.Y * half.Y, unit.Z * half.Z))
                 end
-                local sampleState, hit, thickness = measure(point)
-                if sampleState == "clear" then
-                    report(HitScanEnabled and "Hitscan: clear" or "Direct: clear")
-                    return {FinalPart = hit.Instance, point = hit.Position, offset = Vector3.zero, quality = 1}
-                elseif sampleState == "blocked" and thickness < blockedThickness then
-                    blockedThickness = thickness
+                local trace = WallPen.Probe(part, origin, point, model)
+                if trace.state == "clear" then
+                    return plan(trace.reached or part, point, 1,
+                        HitScanEnabled and "Hitscan: clear" or "Body: clear")
+                elseif trace.state == "blocked" then
+                    considerWall(part, point, trace)
                 end
             end
 
-            -- Through a thin wall on the direct line beats walking the ray
-            -- around cover, so it is offered before manipulation.
-            if WallbangAttemptEnabled and blockedThickness <= WallbangMaxThickness then
-                report(string.format("Wallbang: verified (%.2f studs)", blockedThickness))
-                return {FinalPart = target, point = target.Position, offset = Vector3.zero, quality = 1.5}
+            -- 4. Wallpen: only when the measured cover fits the whole budget
+            --    (thickness and layers), on the thinnest point we found.
+            if WallPen.Enabled and bestWall then
+                -- Refine around the cheapest blocked part: cover is rarely a
+                -- flat slab, so edges of the same wall are often thinner than
+                -- its centre. Only worth the extra rays when we are already
+                -- close to the budget.
+                local trace0 = bestWall.trace
+                if trace0.thickness <= WallPen.MaxThickness * 1.6 then
+                    local part = bestWall.part
+                    for _, axis in ipairs({ {1, 0}, {-1, 0}, {0, 1}, {0, -1} }) do
+                        local offset = Vector3.new(
+                            axis[1] * part.Size.X * 0.35,
+                            axis[2] * part.Size.Y * 0.35,
+                            0)
+                        local point = part.CFrame:PointToWorldSpace(offset)
+                        local trace = WallPen.Probe(part, origin, point, model)
+                        if trace.state == "clear" then
+                            return plan(trace.reached or part, point, 1,
+                                HitScanEnabled and "Hitscan: clear" or "Body: clear")
+                        elseif trace.state == "blocked" then
+                            considerWall(part, point, trace)
+                        end
+                    end
+                end
+                local trace = bestWall.trace
+                local label = string.format("Wallpen: %.2f studs / %dL (max %.2f / %dL)",
+                    trace.thickness, trace.layers, WallPen.MaxThickness, WallPen.MaxLayers)
+                WallPen.Last = {label = label, thickness = trace.thickness,
+                    layers = trace.layers, time = os.clock()}
+                if WallPen.CanPenetrate(trace.thickness, trace.layers) then
+                    if WallPen.ShowMarker then WallPen.Marker(trace) end
+                    return plan(bestWall.part, bestWall.point,
+                        1.5 + trace.thickness * 0.1 + math.max(trace.layers - 1, 0) * 0.05, label)
+                end
+                report(label)
             end
 
+            -- 5. Origin manipulation is the last resort: it always carries risk.
             if ManipEnabled then
                 local offset, _, hitPart = findminoffset(target, origin, true)
                 if offset and hitPart then
-                    report("Manipulated: candidate")
-                    return {FinalPart = hitPart, point = hitPart.Position, offset = offset, quality = 2}
+                    return plan(hitPart, hitPart.Position, 2, "Manipulated: candidate", offset)
                 end
             end
 
-            if WallbangAttemptEnabled and blockedThickness < math.huge then
-                report(string.format("Wallbang: skipped (%.1f studs)", math.min(blockedThickness, 99)))
-            else
-                report(blockedThickness < math.huge and "Blocked" or "No hit")
-            end
+            report(direct.state == "blocked" and "Blocked" or "No hit")
             return nil
         end
 
-        function GetVisibleTarget(Gun)
+        -- `originOverride` is the head the shot will actually be fired from.
+        -- Evaluating from one head and firing from another is what produced
+        -- most UG misses (line checked from above ground, bullet sent from
+        -- below the floor).
+        function GetVisibleTarget(Gun, originOverride)
             local LocalCharacter = LocalPlayer.Character
             local LocalHead = LocalCharacter and LocalCharacter:FindFirstChild("Head")
-            if not LocalHead then 
-                return nil 
+            if not LocalHead then
+                return nil
             end
 
-            local origin = AARealPartPosition(LocalHead)
+            local origin = originOverride or AARealPartPosition(LocalHead)
             local range = Gun:GetAttribute("Range") or math.huge
-            local best, bestDist, bestPriority = nil, math.huge, math.huge
-            local bestFacing = -math.huge
-            local bestQuality = math.huge
             local currentCamera = workspace.CurrentCamera
             local facing = currentCamera and currentCamera.CFrame.LookVector
                 or LocalHead.CFrame.LookVector
 
+            -- Cheap pass, zero rays: only team/alive/range/alignment. The old
+            -- version ran the full shot evaluation (hitscan + wallpen traces)
+            -- on every player in the server, every frame, which is where the
+            -- frame time went. Only the best few candidates get evaluated now.
+            local candidates = {}
             for _, plr in Players:GetPlayers() do
                 local priority = CombatPriority(plr)
-                if not priority then continue end
-                local data = plr.Character
-                if not data then
-                    continue 
-                end
-                if data:FindFirstChildOfClass("ForceField") then 
-                    continue 
-                end
-                local head = data:FindFirstChild("Head")
-                local hum = data:FindFirstChild("Humanoid")
-                if not head or not hum or hum.Health <= 0 then 
-                    continue 
-                end
-
-                local direction = head.Position - origin
-                local dist = direction.Magnitude
-                if dist <= 0.001 or dist > range then continue end
-                -- Preserve team priority, then favor the smallest angle to
-                -- the camera's facing direction. Distance breaks close ties.
-                local alignment = facing:Dot(direction / dist)
-                if priority > bestPriority then continue end
-                local plan = EvaluateShot(head, origin)
-                if plan then
-                    local better = priority < bestPriority
-                        or (priority == bestPriority and plan.quality < bestQuality)
-                        or (priority == bestPriority and plan.quality == bestQuality and alignment > bestFacing + 0.001)
-                        or (priority == bestPriority and plan.quality == bestQuality
-                            and math.abs(alignment - bestFacing) <= 0.001 and dist < bestDist)
-                    if better then
-                        best, bestDist, bestPriority, bestFacing, bestQuality = plan, dist, priority, alignment, plan.quality
+                if priority then
+                    local data = plr.Character
+                    if data and not data:FindFirstChildOfClass("ForceField") then
+                        local head = data:FindFirstChild("Head")
+                        local hum = data:FindFirstChild("Humanoid")
+                        if head and hum and hum.Health > 0 then
+                            local direction = head.Position - origin
+                            local dist = direction.Magnitude
+                            if dist > 0.001 and dist <= range then
+                                candidates[#candidates + 1] = {
+                                    head = head,
+                                    priority = priority,
+                                    dist = dist,
+                                    alignment = facing:Dot(direction / dist),
+                                }
+                            end
+                        end
                     end
+                end
+            end
+            if #candidates == 0 then return nil end
+
+            -- Team priority first, then the smallest angle to the crosshair,
+            -- then distance - exactly the old ordering, just without the rays.
+            table.sort(candidates, function(a, b)
+                if a.priority ~= b.priority then return a.priority < b.priority end
+                if math.abs(a.alignment - b.alignment) > 0.01 then
+                    return a.alignment > b.alignment
+                end
+                return a.dist < b.dist
+            end)
+
+            local best, bestDist, bestPriority = nil, math.huge, math.huge
+            local bestFacing, bestQuality = -math.huge, math.huge
+            local limit = math.min(#candidates, math.max(1, math.floor(MaxAimCandidates)))
+            for i = 1, limit do
+                local candidate = candidates[i]
+                if best and candidate.priority > bestPriority then break end
+                local plan = EvaluateShot(candidate.head, origin)
+                if plan then
+                    local better = best == nil
+                        or candidate.priority < bestPriority
+                        or (candidate.priority == bestPriority and plan.quality < bestQuality - 0.001)
+                        or (candidate.priority == bestPriority
+                            and math.abs(plan.quality - bestQuality) <= 0.001
+                            and candidate.alignment > bestFacing + 0.001)
+                        or (candidate.priority == bestPriority
+                            and math.abs(plan.quality - bestQuality) <= 0.001
+                            and math.abs(candidate.alignment - bestFacing) <= 0.001
+                            and candidate.dist < bestDist)
+                    if better then
+                        best, bestDist, bestPriority = plan, candidate.dist, candidate.priority
+                        bestFacing, bestQuality = candidate.alignment, plan.quality
+                    end
+                end
+                -- A clean line to the top-priority candidate cannot be beaten.
+                if best and bestPriority == candidates[1].priority and bestQuality <= 1.01 then
+                    break
                 end
             end
             if RageBotEnabled and best then ReportTarget(best.FinalPart) end
             return best
         end
-    --#endregion
-
 
 
     --#region silent aim logic
@@ -1128,13 +1725,19 @@ do -- combat
             local character = LocalPlayer.Character
             local head = character and character:FindFirstChild("Head")
             local realOrigin = head and AARealPartPosition(head)
+            local serverOrigin = head and AAServerPartPosition(head)
             local target = SilentAimEnabled and GetTarget()
             if target and realOrigin then
-                local plan = EvaluateShot(target, realOrigin)
-                -- Underground shifts the visible body; fall back to the game's
-                -- own cast origin (usually the camera) if the simulated head
-                -- path is blocked, so shots still resolve while displaced.
-                if not plan and typeof(p30) == "Vector3" and (realOrigin - p30).Magnitude > 4 then
+                -- While UG/AA is displaced the server only validates the
+                -- displaced pose, so that origin is tried first; the real head
+                -- is the fallback for when AA is synced or paused.
+                local plan = serverOrigin and EvaluateShot(target, serverOrigin) or nil
+                if not plan then
+                    plan = EvaluateShot(target, realOrigin)
+                end
+                -- Last resort: the game's own cast origin (usually the camera),
+                -- which still works when both head origins are inside geometry.
+                if not plan and typeof(p30) == "Vector3" then
                     plan = EvaluateShot(target, p30)
                 end
                 if plan then
@@ -1161,6 +1764,46 @@ do -- combat
             restorefunction(getrawmetatable(game).__namecall)
         end
 
+        -- Fires a silent-aim shot once the server pose has settled (transition
+        -- finished or the peek has landed), re-evaluated from that exact pose.
+        local function QueueSilentShot(Args, Target)
+            task.spawn(function()
+                local deadline = os.clock() + 0.6
+                while os.clock() < deadline do
+                    local state = AAShotState()
+                    if state ~= "transition" then
+                        local character = LocalPlayer.Character
+                        local head = character and character:FindFirstChild("Head")
+                        if not head or not Target or not Target.Parent then return end
+                        local origin = (state == "server") and AAServerPartPosition(head)
+                            or AARealPartPosition(head)
+                        local plan = EvaluateShot(Target, origin)
+                        if plan then
+                            origin += plan.offset
+                            for _, v in Args[1] do
+                                if type(v) == "table" then
+                                    v[1] = origin
+                                    v[2] = plan.point
+                                    v[3] = plan.FinalPart
+                                end
+                            end
+                            if state == "real" then AAPeek(AASyncWindow() + 0.1) end
+                            MarkShots(Args[1])
+                            Remotes.ShootEvent:FireServer(table.unpack(Args))
+                            if state == "server" then
+                                local hitModel = plan.FinalPart:FindFirstAncestorOfClass("Model")
+                                FailsafeWatch(hitModel and Players:GetPlayerFromCharacter(hitModel))
+                            end
+                            return
+                        end
+                        -- Underground head still blocked: wait for the peek.
+                        if state == "real" then return end
+                    end
+                    task.wait()
+                end
+            end)
+        end
+
         local mtHook; mtHook = hookfunction(getrawmetatable(game).__namecall, function(self, ...)
             local namecallmethod = getnamecallmethod()
 
@@ -1178,10 +1821,37 @@ do -- combat
                     local Head = LocalCharacter:FindFirstChild("Head")
 
                     if Head then
-                        local origin = AARealPartPosition(Head)
+                        -- Build the shot from the pose the server holds RIGHT
+                        -- NOW (lag included). Never fire from the real head
+                        -- while the server still has us underground (= invalid).
+                        local state = AAShotState()
+                        local serverOrigin = AAServerPartPosition(Head)
+                        local realOrigin = AARealPartPosition(Head)
+                        local origin, plan, queue = nil, nil, false
+                        if state == "server" then
+                            origin = serverOrigin
+                            plan = EvaluateShot(Target, serverOrigin)
+                            if not plan and EvaluateShot(Target, realOrigin)
+                                and AAPeek(AASyncWindow() * 2 + 0.15) then
+                                -- Underground head has no line but the real one
+                                -- does: peek and fire once the server has it.
+                                queue = true
+                            end
+                        elseif state == "real" then
+                            origin = realOrigin
+                            plan = EvaluateShot(Target, realOrigin)
+                            -- Keep the real pose until this shot is validated.
+                            if plan then AAPeek(AASyncWindow() + 0.1) end
+                        else
+                            queue = true
+                        end
 
-                        if FailsafeReady() then PauseAAForAction(0.25) end
-                        local plan = Target and EvaluateShot(Target, origin)
+                        if queue then
+                            QueueSilentShot(Args, Target)
+                            setnamecallmethod(namecallmethod)
+                            return nil
+                        end
+
                         if plan then
                             origin += plan.offset
                             for _, v in Args[1] do
@@ -1189,8 +1859,16 @@ do -- combat
                                 v[2] = plan.point
                                 v[3] = plan.FinalPart
                             end
-                            local hitModel = plan.FinalPart and plan.FinalPart:FindFirstAncestorOfClass("Model")
-                            FailsafeWatch(hitModel and Players:GetPlayerFromCharacter(hitModel))
+                            if state == "server" then
+                                local hitModel = plan.FinalPart and plan.FinalPart:FindFirstAncestorOfClass("Model")
+                                FailsafeWatch(hitModel and Players:GetPlayerFromCharacter(hitModel))
+                            end
+                        elseif state == "server" then
+                            -- No plan: still send it from the pose the server
+                            -- holds so it is a plain miss, not an invalid.
+                            for _, v in Args[1] do
+                                if type(v) == "table" then v[1] = serverOrigin end
+                            end
                         end
                     end
                 end
@@ -1250,19 +1928,43 @@ do -- combat
                     continue
                 end
 
-                local t = GetVisibleTarget(Gun)
-
-                if not t then
+                -- Shot origin = the pose the server holds right now, lag
+                -- included. During a pose change nothing is fired (those were
+                -- the invalids); the loop just waits a few frames.
+                local state = AAShotState()
+                if state == "transition" then
                     continue
+                end
+
+                local origin, t
+                if state == "server" then
+                    origin = AAServerPartPosition(LocalHead)
+                    t = GetVisibleTarget(Gun, origin)
+                    if not t then
+                        -- Underground head has no line. If the real head does,
+                        -- peek: the next shots come from the real pose once the
+                        -- server has it, then UG returns.
+                        local realHead = AARealPartPosition(LocalHead)
+                        if GetVisibleTarget(Gun, realHead) then
+                            AAPeek(AASyncWindow() * 2 + 0.15)
+                        end
+                        continue
+                    end
+                else
+                    origin = AARealPartPosition(LocalHead)
+                    t = GetVisibleTarget(Gun, origin)
+                    if not t then
+                        continue
+                    end
+                    -- Hold the real pose until the server validated this shot.
+                    AAPeek(AASyncWindow() + 0.1)
                 end
 
                 local FinalPart = t.FinalPart
                 local targetModel = FinalPart and FinalPart:FindFirstAncestorOfClass("Model")
                 local targetPlayer = targetModel and Players:GetPlayerFromCharacter(targetModel)
                 if not targetPlayer or not CombatPriority(targetPlayer) then continue end
-                -- Only snap back once several shots in a row have failed.
-                if FailsafeReady() then PauseAAForAction(0.25) end
-                local origin = AARealPartPosition(LocalHead) + t.offset
+                origin = origin + t.offset
                 local Shots = {}
 
                 for i = 1, Gun:GetAttribute("ProjectileCount") or 1 do
@@ -1276,7 +1978,7 @@ do -- combat
                 end
 
                 Remotes.ShootEvent:FireServer(Shots)
-                FailsafeWatch(targetPlayer)
+                if state == "server" then FailsafeWatch(targetPlayer) end
                 Gun:SetAttribute("Local_CurrentAmmo", Ammo - 1)
             end
         end)
@@ -1293,8 +1995,13 @@ do -- combat
             restorefunction(shoot)
         end 
 
-        local old; old = hookfunction(shoot, function(...) 
-            local upvs = debug.getupvalues(shoot)
+        local oldShoot; oldShoot = hookfunction(shoot, function(...) 
+            -- The upvalue walk is not free and the gun config table never
+            -- moves, so it is only read while one of the mods is actually on.
+            if not (ForceFullAuto or RapidFireEnabled or NoSpread) then
+                return oldShoot(...)
+            end
+            local upvs = (debug :: any).getupvalues(shoot)
 
             --[[for i, v in upvs do 
                 if type(v) == 'table' then 
@@ -1318,21 +2025,25 @@ do -- combat
                 upvs[10].SpreadRadius = 0
             end
             
-            return old(...)
+            return oldShoot(...)
         end)
 
         if isfunctionhooked(task.wait) then 
             restorefunction(task.wait)
         end 
 
-        local old; old = hookfunction(task.wait, function(time, ...)
-            local tb = debug.traceback()
-            
-            if InstantReload and tb:find('reload') then 
-                time = 0
+        -- debug.traceback() is one of the most expensive calls available and
+        -- the old version ran it on EVERY task.wait() in the whole game, even
+        -- with instant reload off. It is only needed while the mod is on.
+        local oldWait; oldWait = hookfunction(task.wait, function(time, ...)
+            if InstantReload and type(time) == "number" and time > 0 then
+                local ok, tb = pcall(debug.traceback)
+                if ok and type(tb) == "string" and tb:find("reload", 1, true) then
+                    time = 0
+                end
             end
 
-            return old(time, ...)
+            return oldWait(time, ...)
         end)
 
     --#endregion
@@ -1417,14 +2128,31 @@ do -- combat
             Min = 1; Max = 200; Default = 32; Decimals = 1;
             Callback = function(v) HitScanCount = v end;
         })
+        -- How many of the best candidates the aim actually evaluates per shot.
+        -- Lower = fewer raycasts = more fps; every candidate above this is only
+        -- sorted by team/alignment/distance, so the chosen target rarely changes.
         Sections.aimbot:Slider({
-            Name = "wallbangprivate max wall (studs)"; Flag = "wallbangprivate_thickness";
-            Min = 0.25; Max = 5; Default = 1.25; Decimals = 2;
-            Callback = function(v) WallbangMaxThickness = v end;
+            Name = "aim candidates (fps)"; Flag = "aimcandidates";
+            Min = 1; Max = 25; Default = 8; Decimals = 1;
+            Callback = function(v) MaxAimCandidates = v end;
         })
         Sections.aimbot:Toggle({
-            Name = "wallbangprivate"; Flag = "wallbangprivate"; Default = false;
-            Callback = function(v) WallbangAttemptEnabled = v end;
+            Name = "wallpen"; Flag = "wallpen"; Default = false;
+            Callback = function(v) WallPen.Enabled = v end;
+        })
+        -- One slider owns the whole penetration budget: it scales the wall
+        -- thickness and the layer count together, so the layer limit can never
+        -- sit above what the thickness limit allows.
+        --    25%  = 1.25 studs / 2 layers   (default)
+        --    100% = 5.00 studs / 6 layers
+        Sections.aimbot:Slider({
+            Name = "wallpen max (walls + layers)"; Flag = "wallpen_max";
+            Min = 1; Max = 100; Default = 25; Decimals = 1;
+            Callback = function(v) WallPen.ApplyBudget(v) end;
+        })
+        Sections.aimbot:Toggle({
+            Name = "wallpen hit marker"; Flag = "wallpen_marker"; Default = true;
+            Callback = function(v) WallPen.ShowMarker = v end;
         })
         Sections.aimbot:Slider({
             Name = "hostile inmate threat range"; Flag = "aggrorange";
@@ -1980,6 +2708,7 @@ RunService.RenderStepped:Connect(function(delta)
     if not GhostEnabled or not Ghost or not GhostCharacter then
         return
     end
+    if not Ghost.Parent then return end
 
     local character = GhostCharacter
     local root = character:FindFirstChild("HumanoidRootPart")
@@ -2220,7 +2949,6 @@ Sections.visuals:Toggle({
 -- ==========================================
 
 local ResolverEnabled = false
-local ResolverPanelEnabled = false
 
 local ResolverPlayers = {}
 ResolverSnapshot = ResolverPlayers
@@ -2629,7 +3357,6 @@ Sections.visuals:Toggle({
     Default = false,
 
     Callback = function(value)
-        ResolverPanelEnabled = value
         ResolverPanel.Visible = value
     end
 })
@@ -2638,8 +3365,8 @@ Sections.visuals:Toggle({
     
     
     
-    local oldmin = LocalPlayer.CameraMinZoomDistance
-    local oldmax = LocalPlayer.CameraMaxZoomDistance
+    local _oldmin = LocalPlayer.CameraMinZoomDistance
+    local _oldmax = LocalPlayer.CameraMaxZoomDistance
 
 
     --[[
@@ -2694,9 +3421,13 @@ Sections.visuals:Toggle({
 
         RunService.RenderStepped:Connect(function()
             if FullbrightEnabled then
-                Lighting.Brightness = 3
+                -- Guarded: writing the same value every frame still fires
+                -- property-changed signals all over the lighting system.
+                if Lighting.Brightness ~= 3 then Lighting.Brightness = 3 end
                 --Lighting.ClockTime = 18.5
-                Lighting.ExposureCompensation = 0.5
+                if Lighting.ExposureCompensation ~= 0.5 then
+                    Lighting.ExposureCompensation = 0.5
+                end
                 
                 if Lighting.Ambient ~= TsAmbient then 
                     Lighting.Ambient = TsAmbient 
@@ -3398,13 +4129,13 @@ do -- misc
     local SpeedhackEnabled = false;
 local SpeedhackSpeed = 2;
 
-local NoclipEnabled = true
+local _NoclipEnabled = true
 
 --#region infinite jump
 
 local InfiniteJumpEnabled = false
 
-local InfiniteJumpConnection =
+local _InfiniteJumpConnection =
     UserInputService.JumpRequest:Connect(function()
 
         if not InfiniteJumpEnabled then
@@ -3425,9 +4156,6 @@ local InfiniteJumpConnection =
 -- ==========================================
 -- INVAL TIMER - STANDALONE LOCAL SCRIPT
 -- ==========================================
-
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
 
 local Player = Players.LocalPlayer
 local PlayerGui = Player:WaitForChild("PlayerGui")
@@ -3631,7 +4359,9 @@ end)
 
     --#region speed hack
 
-        local speedhackconnection = RunService.Heartbeat:Connect(function(delta)
+        -- PreSimulation (before physics): always moves the real body, never
+        -- the UG server pose, so UG cannot erase the movement.
+        local _speedhackconnection = RunService.PreSimulation:Connect(function(delta)
             if SpeedhackEnabled then 
                 if not LocalPlayer.Character then 
                     return 
@@ -3724,8 +4454,26 @@ end
 
 
 
--- Advanced AA: offsets are restored before simulation and shown with a local visual copy.
--- Replication is controlled by Roblox and is not guaranteed.
+-- Advanced AA / underground.
+--
+-- Desync order (per frame):
+--   physics -> Heartbeat: save the real pose, move the body to the fake
+--              (server) pose. Replication sends THIS pose to the server.
+--   next frame, RenderStep First (before the camera): put the real pose back.
+--   PreSimulation: safety restore, so physics only ever simulates the real
+--              pose.
+-- Result: the server body sits underground, the client body stays above
+-- ground with normal physics, and the camera (shift lock included) only ever
+-- sees the real body. Collision is never touched, so no falling through the
+-- map. The real CFrames are saved and written back exactly (not inverted), so
+-- knockback / teleports can never leave the body stuck below the floor.
+--
+-- UG is a pure Y move: the depth slider only changes height. Horizontal pose
+-- rolls the body 90 degrees around the character's facing direction so it
+-- lies flat with its right side facing up.
+--
+-- The ONLY thing that drops the desync mid-fight is the failsafe - a miss
+-- streak turns UG off for one second, then it returns on its own.
 do
     local env = (type(getgenv) == "function" and getgenv()) or _G
     if type(env.AdvancedAACleanup) == "function" then
@@ -3739,47 +4487,173 @@ do
         Prism = false,
         Underground = false,
         SafeFooting = true,
+        HorizontalUG = true,
+        ShotPeek = true,
         Range = 4,
         Height = 4,
         UndergroundDepth = 20,
         Speed = 4,
     }
-    local appliedRoot = nil
-    local appliedOffset = Vector3.zero
-    local appliedRotation = CFrame.new()
+
+    -- Real pose saved at Heartbeat, written back before render / physics.
+    local savedPose = {}          -- [part] = real CFrame
+    local savedCharacter = nil
+    local savedRoot, savedExpected, savedOffset = nil, nil, Vector3.zero
+    local displaced = false       -- body is currently in the server pose
+    -- Last server pose, kept after the restore so shot origins stay correct
+    -- for code that runs while the body is back in the real pose.
+    local serverTransform = nil
+    local serverOffset = Vector3.zero
+
+    local assemblyParts, assemblyCharacter, assemblyDirty = {}, nil, true
+    local assemblyConns = {}
+    local function BindAssembly(character)
+        for _, connection in ipairs(assemblyConns) do
+            pcall(function() connection:Disconnect() end)
+        end
+        table.clear(assemblyConns)
+        table.clear(assemblyParts)
+        assemblyCharacter, assemblyDirty = character, true
+        if character then
+            table.insert(assemblyConns, character.DescendantAdded:Connect(function()
+                assemblyDirty = true
+            end))
+            table.insert(assemblyConns, character.DescendantRemoving:Connect(function()
+                assemblyDirty = true
+            end))
+        end
+    end
+    local function AssemblyParts(character)
+        if assemblyCharacter ~= character then BindAssembly(character) end
+        if assemblyDirty then
+            table.clear(assemblyParts)
+            for _, obj in ipairs(character:GetDescendants()) do
+                if obj:IsA("BasePart") and not obj.Anchored then
+                    assemblyParts[#assemblyParts + 1] = obj
+                end
+            end
+            assemblyDirty = false
+        end
+        return assemblyParts
+    end
+
     local phase = 0
     local pausedUntil = 0
+    local forceSyncUntil = 0
     local promptHeld = false
     local connections = {}
     local renderKey = "AdvancedAA_Restore_" .. tostring(LocalPlayer.UserId)
 
-    local function restoreOffset()
-        local oldRoot, offset, rotation = appliedRoot, appliedOffset, appliedRotation
-        appliedRoot = nil
-        appliedOffset = Vector3.zero
-        appliedRotation = CFrame.new()
-        if oldRoot and oldRoot.Parent then
-            oldRoot.CFrame = (oldRoot.CFrame - offset) * rotation:Inverse()
+    local function now() return os.clock() end
+    local function add(connection) table.insert(connections, connection) end
+
+    -- Pose bookkeeping for the aim: when did the server last get each pose.
+    local lastDisplacedAt, lastRealAt = 0, os.clock()
+    -- Shot peek state.
+    local peekUntil, peekStart, peekEndedAt = 0, 0, 0
+    local PEEK_MAX, PEEK_COOLDOWN = 0.8, 0.4
+
+    local function syncWindow()
+        local ok, ping = pcall(function() return LocalPlayer:GetNetworkPing() end)
+        ping = (ok and tonumber(ping)) or 0.1
+        return math.clamp(ping + 0.05, 0.08, 0.45)
+    end
+
+    -- Put the exact real pose back. Never skipped.
+    local function restorePose()
+        if not displaced then return end
+        displaced = false
+        local character = savedCharacter
+        savedCharacter = nil
+        -- Anything that moved us while displaced (speed hack, fly, knockback,
+        -- teleports) is carried over instead of being erased.
+        local correction = Vector3.zero
+        if savedRoot and savedRoot.Parent and savedExpected then
+            local drift = savedRoot.Position - savedExpected
+            if drift.Magnitude > 50 then
+                -- teleport: land exactly where the game put the root
+                correction = drift + savedOffset
+            elseif drift.Magnitude > 0.001 then
+                correction = drift
+            end
         end
+        savedRoot, savedExpected, savedOffset = nil, nil, Vector3.zero
+        if character and character.Parent then
+            for part, cf in pairs(savedPose) do
+                if part.Parent then
+                    pcall(function() part.CFrame = cf + correction end)
+                end
+            end
+        end
+        table.clear(savedPose)
+    end
+
+    local function clearServerPose()
+        serverTransform, serverOffset = nil, Vector3.zero
     end
 
     local function pauseAA(seconds)
-        pausedUntil = math.max(pausedUntil, os.clock() + (seconds or 1.25))
-        restoreOffset()
-    end
-    env.AdvancedAAPause = pauseAA
-    env.AdvancedAAOffset = function() return appliedOffset end
-    env.AdvancedAAUnshiftPosition = function(position)
-        if not appliedRoot or not appliedRoot.Parent then return position end
-        local displacedRoot = appliedRoot.CFrame
-        local realRoot = (displacedRoot - appliedOffset) * appliedRotation:Inverse()
-        return realRoot:PointToWorldSpace(displacedRoot:PointToObjectSpace(position))
+        pausedUntil = math.max(pausedUntil, now() + (seconds or 1.25))
+        restorePose()
+        clearServerPose()
     end
 
-    -- Pause while interacting so pickup distance checks see the undisplaced
-    -- character. Mouse clicks only pause for objects with a ClickDetector.
+    -- Failsafe: drop the desync entirely for a moment (real-pose shots).
+    local function forceSync(seconds)
+        forceSyncUntil = math.max(forceSyncUntil, now() + (seconds or 1))
+        pausedUntil = math.max(pausedUntil, forceSyncUntil)
+        restorePose()
+        clearServerPose()
+    end
+
+    env.AdvancedAASyncWindow = syncWindow
+    env.AdvancedAAShotState = function()
+        local t, w = now(), syncWindow()
+        if lastDisplacedAt > lastRealAt then
+            -- Displacing: the server has the underground pose once the
+            -- last real-pose frame is older than the network window.
+            return (t - lastRealAt >= w) and "server" or "transition"
+        end
+        return (t - lastDisplacedAt >= w) and "real" or "transition"
+    end
+    env.AdvancedAAPeek = function(seconds)
+        if not settings.ShotPeek or not settings.Enabled then return false end
+        local t = now()
+        if t < peekUntil then
+            -- Already peeking: extend, but never past the cap.
+            if t - peekStart > PEEK_MAX then return false end
+            peekUntil = math.max(peekUntil, math.min(t + seconds, peekStart + PEEK_MAX + 0.2))
+            return true
+        end
+        if peekUntil > 0 and t - peekUntil < PEEK_COOLDOWN then return false end
+        peekStart, peekUntil = t, t + seconds
+        return true
+    end
+
+    env.AdvancedAAPause = pauseAA
+    env.AdvancedAAForceSync = forceSync
+    env.AdvancedAAStatus = function()
+        return settings.Enabled == true, serverOffset.Magnitude, now() < forceSyncUntil
+    end
+    env.AdvancedAADesync = function()
+        if now() < forceSyncUntil then return 0 end
+        return serverOffset.Magnitude
+    end
+    env.AdvancedAAOffset = function() return serverOffset end
+    -- Where a given part position is on the SERVER body.
+    env.AdvancedAAServerPosition = function(position)
+        if displaced or not serverTransform then return position end
+        return serverTransform * position
+    end
+    -- Where a given part position is on the REAL (client) body.
+    env.AdvancedAAUnshiftPosition = function(position)
+        if not displaced or not serverTransform then return position end
+        return serverTransform:Inverse() * position
+    end
+
+    -- Pause while interacting so pickup distance checks see the real body.
     local mouse = LocalPlayer:GetMouse()
-    table.insert(connections, UserInputService.InputBegan:Connect(function(input, processed)
+    add(UserInputService.InputBegan:Connect(function(input, processed)
         if processed then return end
         if input.KeyCode == Enum.KeyCode.E then
             pauseAA(1.25)
@@ -3795,16 +4669,17 @@ do
             end
         end
     end))
+
     local promptService = game:GetService("ProximityPromptService")
-    table.insert(connections, promptService.PromptButtonHoldBegan:Connect(function()
+    add(promptService.PromptButtonHoldBegan:Connect(function()
         promptHeld = true
         pauseAA(1.25)
     end))
-    table.insert(connections, promptService.PromptButtonHoldEnded:Connect(function()
+    add(promptService.PromptButtonHoldEnded:Connect(function()
         promptHeld = false
         pauseAA(1.25)
     end))
-    table.insert(connections, promptService.PromptTriggered:Connect(function()
+    add(promptService.PromptTriggered:Connect(function()
         promptHeld = false
         pauseAA(1.25)
     end))
@@ -3820,153 +4695,123 @@ do
     end
 
     local function calculateOffset(t)
+        -- UG is a pure vertical move: X and Z are always 0, the depth slider
+        -- is the only thing that changes it.
+        if settings.Underground then
+            return Vector3.new(0, -math.clamp(settings.UndergroundDepth, 1, 30), 0)
+        end
         local horizontal = Vector3.zero
-        -- Square and prism use the same horizontal path; enabling both does
-        -- not double its radius. Prism adds the vertical component.
         if settings.Square or settings.Prism then horizontal = square(t) * settings.Range end
         local height = 0
         if settings.Prism then
             height = (1 - math.abs(2 * ((t * 0.5) % 1) - 1)) * settings.Height
         end
-        if settings.Underground then
-            -- Clamp the combined prism/UG offset so it remains underground.
-            height = -math.clamp(settings.UndergroundDepth - height, 1, 25)
-        end
         return horizontal + Vector3.new(0, height, 0)
     end
 
-    local visual, visualCharacter, pairsList = nil, nil, {}
-    local savedTransparency = {}
-    local function destroyVisual()
-        local cam = workspace.CurrentCamera
-        if cam and visual then
-            local currentCharacter = LocalPlayer.Character
-            local hum = currentCharacter and currentCharacter:FindFirstChildOfClass("Humanoid")
-            if hum and cam.CameraSubject and cam.CameraSubject:IsDescendantOf(visual) then
-                cam.CameraSubject = hum
-            end
-        end
-        for part, value in pairs(savedTransparency) do
-            if part.Parent then part.LocalTransparencyModifier = value end
-        end
-        table.clear(savedTransparency)
-        table.clear(pairsList)
-        if visual then visual:Destroy() end
-        visual, visualCharacter = nil, nil
-    end
-    local function makeVisual(character)
-        destroyVisual()
-        local was = character.Archivable
-        character.Archivable = true
-        local ok, clone = pcall(function() return character:Clone() end)
-        character.Archivable = was
-        if not ok or not clone then return end
-        visual, visualCharacter = clone, character
-        clone.Name = "AdvancedAALocalVisual"
-        for _, obj in ipairs(clone:GetDescendants()) do
-            if obj:IsA("BaseScript") then obj:Destroy()
-            elseif obj:IsA("BasePart") then
-                obj.Anchored = true
-                obj.CanCollide = false
-                obj.CanTouch = false
-                obj.CanQuery = false
-                obj.LocalTransparencyModifier = 0
-            end
-        end
-        clone.Parent = workspace
-        for _, part in ipairs(clone:GetDescendants()) do
-            if part:IsA("BasePart") then
-                local parent = part.Parent
-                local originalParent = parent == clone and character
-                    or (parent and character:FindFirstChild(parent.Name))
-                local original = originalParent and originalParent:FindFirstChild(part.Name)
-                if original and original:IsA("BasePart") then
-                    table.insert(pairsList, {part, original})
-                end
-            end
-        end
-        local hum = clone:FindFirstChildOfClass("Humanoid")
-        if hum then
-            hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
-            local cam = workspace.CurrentCamera
-            local realHum = character:FindFirstChildOfClass("Humanoid")
-            if cam and (cam.CameraSubject == realHum or cam.CameraSubject == nil) then
-                cam.CameraSubject = hum
-            end
-        end
-    end
-    local function renderVisual()
-        -- Grounded mode returns the actual character to its simulated position
-        -- before rendering. This may prevent UG from replicating to the server.
-        if settings.Underground and settings.SafeFooting then
-            restoreOffset()
-            destroyVisual()
-            return
-        end
+    -- Safe footing for square / prism: the server pose must not end up
+    -- inside a wall.
+    local overlap = OverlapParams.new()
+    overlap.FilterType = Enum.RaycastFilterType.Exclude
+    overlap.MaxParts = 8
+    local function SpaceFree(position)
+        overlap.FilterDescendantsInstances = AAIgnoreList()
+        local ok, parts = pcall(function()
+            return workspace:GetPartBoundsInRadius(position, 0.8, overlap)
+        end)
+        if not ok or not parts then return true end
         local character = LocalPlayer.Character
-        if not settings.Enabled or not character then destroyVisual(); return end
-        local realHum = character:FindFirstChildOfClass("Humanoid")
-        local root = character:FindFirstChild("HumanoidRootPart")
-        if not realHum or realHum.Health <= 0 or not root then
-            destroyVisual()
-            return
-        end
-        if visualCharacter ~= character or not visual then makeVisual(character) end
-        if not visual then return end
-        -- Roblox can reset the camera subject after CharacterAdded.
-        local camera = workspace.CurrentCamera
-        local cloneHum = visual:FindFirstChildOfClass("Humanoid")
-        if camera and cloneHum and camera.CameraSubject == realHum then
-            camera.CameraSubject = cloneHum
-        end
-        for _, pair in ipairs(pairsList) do
-            local copy, original = pair[1], pair[2]
-            if copy.Parent and original.Parent then
-                if appliedRoot and appliedRoot.Parent then
-                    local displaced = appliedRoot.CFrame
-                    local real = (displaced - appliedOffset) * appliedRotation:Inverse()
-                    copy.CFrame = real * displaced:ToObjectSpace(original.CFrame)
-                else
-                    copy.CFrame = original.CFrame
-                end
-                if savedTransparency[original] == nil then
-                    savedTransparency[original] = original.LocalTransparencyModifier
-                end
-                original.LocalTransparencyModifier = 1
+        for _, part in ipairs(parts) do
+            if character and part:IsDescendantOf(character) then continue end
+            if part:IsA("BasePart") and part.CanCollide and part.Transparency < 0.95 then
+                return false
             end
         end
+        return true
     end
 
-    table.insert(connections, RunService.PreSimulation:Connect(restoreOffset))
-    table.insert(connections, RunService.Heartbeat:Connect(function(dt)
-        restoreOffset()
-        if not settings.Enabled or promptHeld or os.clock() < pausedUntil then return end
+    -- Heartbeat: runs after physics, right before replication is sent.
+    local applyServerPoseInner
+    local function applyServerPose(dt)
+        applyServerPoseInner(dt)
+        if displaced then lastDisplacedAt = now() else lastRealAt = now() end
+    end
+    function applyServerPoseInner(dt)
+        restorePose()
+        clearServerPose()
+        if not settings.Enabled or promptHeld then return end
+        local t = now()
+        if t < pausedUntil or t < forceSyncUntil or t < peekUntil then return end
         local character = LocalPlayer.Character
         local root = character and character:FindFirstChild("HumanoidRootPart")
         local humanoid = character and character:FindFirstChildOfClass("Humanoid")
         if not root or not humanoid or humanoid.Health <= 0 then return end
+        if humanoid.SeatPart ~= nil or humanoid.Sit then return end
+        local state = humanoid:GetState()
+        if state == Enum.HumanoidStateType.Seated or state == Enum.HumanoidStateType.Physics
+            or state == Enum.HumanoidStateType.Climbing or state == Enum.HumanoidStateType.Dead then
+            return
+        end
+
         phase = (phase + math.min(dt, 0.1) * settings.Speed) % 2
         local offset = calculateOffset(phase)
-        local rotation = settings.Underground and CFrame.Angles(0, 0, math.rad(90)) or CFrame.new()
-        appliedRoot = root
-        appliedOffset = offset
-        appliedRotation = rotation
-        root.CFrame = (root.CFrame * rotation) + offset
-    end))
+        if settings.SafeFooting and not settings.Underground and offset.Magnitude > 0.001 then
+            local scale = 1
+            for _ = 1, 4 do
+                if SpaceFree(root.Position + offset * scale) then break end
+                scale = scale * 0.5
+            end
+            offset = (scale < 0.25) and Vector3.zero or offset * scale
+        end
+        if offset.Magnitude < 0.001 then return end
+        local pivot = root.Position
+        local destination = pivot + offset
+        if destination.Y < workspace.FallenPartsDestroyHeight + 50 then return end
 
-    -- Keep the displacement through rendering to give replication a chance;
-    -- show a local copy at the undisplaced location. Server acceptance is not guaranteed.
-    RunService:BindToRenderStep(renderKey, Enum.RenderPriority.Camera.Value - 1, renderVisual)
-    table.insert(connections, LocalPlayer.CharacterRemoving:Connect(function()
-        restoreOffset()
-        destroyVisual()
+        -- Rotation (UG horizontal only): roll -90 degrees around the
+        -- character's own facing direction -> lies flat, right side up.
+        local rotation = CFrame.new()
+        if settings.Underground and settings.HorizontalUG then
+            local look = root.CFrame.LookVector
+            look = Vector3.new(look.X, 0, look.Z)
+            if look.Magnitude > 0.01 then
+                rotation = CFrame.fromAxisAngle(look.Unit, -math.pi / 2)
+            end
+        end
+        -- Rotate around the root, then move straight down by the offset.
+        local transform = CFrame.new(pivot + offset) * rotation * CFrame.new(-pivot)
+
+        local parts = AssemblyParts(character)
+        table.clear(savedPose)
+        for i = 1, #parts do
+            local part = parts[i]
+            if part.Parent then savedPose[part] = part.CFrame end
+        end
+        savedCharacter = character
+        savedRoot, savedExpected, savedOffset = root, destination, offset
+        displaced = true
+        for part, cf in pairs(savedPose) do
+            pcall(function() part.CFrame = transform * cf end)
+        end
+        serverTransform, serverOffset = transform, offset
+    end
+
+    add(RunService.Heartbeat:Connect(applyServerPose))
+    -- Before the camera and render: real body back, so the client sees and
+    -- the camera follows the real pose.
+    RunService:BindToRenderStep(renderKey, Enum.RenderPriority.First.Value, restorePose)
+    -- Before physics: always simulate the real pose.
+    add(RunService.PreSimulation:Connect(restorePose))
+    add(LocalPlayer.CharacterRemoving:Connect(function()
+        restorePose()
+        clearServerPose()
     end))
 
     section:Toggle({
         Name = "advanced aa", Flag = "advanced_aa_enabled", Default = false,
         Callback = function(value)
             settings.Enabled = value
-            if not value then restoreOffset(); destroyVisual() end
+            if not value then restorePose(); clearServerPose() end
         end,
     })
     section:Toggle({ Name = "square", Flag = "advanced_aa_square", Default = true,
@@ -3975,19 +4820,29 @@ do
         Callback = function(value) settings.Prism = value end })
     section:Toggle({ Name = "underground", Flag = "advanced_aa_underground", Default = false,
         Callback = function(value) settings.Underground = value end })
+    section:Toggle({ Name = "ug horizontal (right side up)", Flag = "advanced_aa_ughorizontal",
+        Default = true,
+        Callback = function(value) settings.HorizontalUG = value end })
+    section:Toggle({ Name = "ug shot peek (fewer invalids)", Flag = "advanced_aa_shotpeek",
+        Default = true,
+        Callback = function(value) settings.ShotPeek = value; if not value then peekUntil = 0 end end })
+    local function failsafeSet(enabled, attempts, syncTime)
+        local target = (type(getgenv) == "function" and getgenv()) or _G
+        if type(target.AdvancedAASetFailsafe) == "function" then
+            pcall(target.AdvancedAASetFailsafe, enabled, attempts, syncTime)
+        end
+    end
     section:Toggle({ Name = "failsafe", Flag = "failsafe", Default = true,
-        Callback = function(value)
-            FailsafeEnabled = value
-            if not value then FailsafeMissStreak = 0 end
-        end })
+        Callback = function(value) failsafeSet(value) end })
     section:Slider({ Name = "failsafe after misses", Flag = "failsafeattempts",
         Min = 1, Max = 8, Default = 3, Decimals = 1,
-        Callback = function(value) FailsafeAttempts = value end })
-    section:Toggle({ Name = "ug safe footing", Flag = "advanced_aa_safefooting", Default = true,
-        Callback = function(value)
-            settings.SafeFooting = value
-            if value then restoreOffset() end
-        end })
+        Callback = function(value) failsafeSet(nil, value) end })
+    section:Slider({ Name = "failsafe pause time (s)", Flag = "failsafepausetime",
+        Min = 0.1, Max = 8, Default = 1, Decimals = 0.05,
+        Callback = function(value) failsafeSet(nil, nil, value) end })
+    section:Toggle({ Name = "safe footing (square / prism)", Flag = "advanced_aa_safefooting",
+        Default = true,
+        Callback = function(value) settings.SafeFooting = value end })
     section:Slider({
         Name = "aa range (studs)", Flag = "advanced_aa_range",
         Min = 0, Max = 30, Default = 4, Decimals = 1,
@@ -3999,7 +4854,7 @@ do
         Callback = function(value) settings.Height = value end,
     })
     section:Slider({
-        Name = "underground depth (studs)", Flag = "advanced_aa_ug_depth",
+        Name = "underground depth (studs, Y)", Flag = "advanced_aa_ug_depth",
         Min = 1, Max = 25, Default = 20, Decimals = 1,
         Callback = function(value) settings.UndergroundDepth = value end,
     })
@@ -4011,14 +4866,29 @@ do
 
     env.AdvancedAACleanup = function()
         settings.Enabled = false
-        restoreOffset()
-        destroyVisual()
-        RunService:UnbindFromRenderStep(renderKey)
-        for _, connection in ipairs(connections) do connection:Disconnect() end
+        restorePose()
+        clearServerPose()
+        pcall(function() RunService:UnbindFromRenderStep(renderKey) end)
+        for _, connection in ipairs(connections) do
+            pcall(function() connection:Disconnect() end)
+        end
         table.clear(connections)
+        for _, connection in ipairs(assemblyConns) do
+            pcall(function() connection:Disconnect() end)
+        end
+        table.clear(assemblyConns)
+        table.clear(assemblyParts)
+        assemblyCharacter = nil
         if env.AdvancedAAPause == pauseAA then env.AdvancedAAPause = nil end
+        if env.AdvancedAAForceSync == forceSync then env.AdvancedAAForceSync = nil end
+        env.AdvancedAAStatus = nil
+        env.AdvancedAADesync = nil
         env.AdvancedAAOffset = nil
+        env.AdvancedAAServerPosition = nil
         env.AdvancedAAUnshiftPosition = nil
+        env.AdvancedAAShotState = nil
+        env.AdvancedAAPeek = nil
+        env.AdvancedAASyncWindow = nil
     end
 end
 
