@@ -1987,6 +1987,242 @@ do -- combat
 
 
 
+    --#region peek shot / underground resolver
+        -- For targets nothing else can hit (underground cheaters, or anyone
+        -- with no line from either of our heads): teleport to a spot that has
+        -- a clear line to them, fire, and teleport straight back. The whole
+        -- trip is ~ping + hold time + ping, well under a second.
+        local PeekResolver = {
+            Enabled = false,
+            OnlyUnderground = true,
+            Hold = 0.35,
+            Cooldown = 1.5,
+            Range = 300,
+            Busy = false,
+            LastRun = 0,
+        }
+
+        local peekParams = RaycastParams.new()
+        peekParams.FilterType = Enum.RaycastFilterType.Exclude
+        peekParams.IgnoreWater = true
+        local peekOverlap = OverlapParams.new()
+        peekOverlap.FilterType = Enum.RaycastFilterType.Exclude
+        peekOverlap.MaxParts = 6
+
+        local function PeekIgnore(targetModel)
+            local list = table.clone(AAIgnoreList())
+            if targetModel then table.insert(list, targetModel) end
+            return list
+        end
+
+        -- Underground = solid geometry right above the head and nothing to
+        -- stand on below it (below the map / inside the floor slab).
+        local function IsUnderground(model)
+            local head = model and model:FindFirstChild("Head")
+            if not head then return false end
+            peekParams.FilterDescendantsInstances = PeekIgnore(model)
+            local up = workspace:Raycast(head.Position, Vector3.new(0, 60, 0), peekParams)
+            if not up then return false end
+            local down = workspace:Raycast(head.Position, Vector3.new(0, -12, 0), peekParams)
+            return down == nil
+        end
+
+        local function SpotFree(position, targetModel)
+            peekOverlap.FilterDescendantsInstances = PeekIgnore(targetModel)
+            local ok, parts = pcall(function()
+                return workspace:GetPartBoundsInRadius(position, 1.6, peekOverlap)
+            end)
+            if not ok or not parts then return false end
+            for _, part in ipairs(parts) do
+                if part:IsA("BasePart") and part.CanCollide and part.Transparency < 0.95 then
+                    return false
+                end
+            end
+            return true
+        end
+
+        -- Head position near the target with free space and a clear line.
+        local function FindPeekSpot(targetPart, model)
+            local golden = math.pi * (3 - math.sqrt(5))
+            local count = 24
+            local minY = workspace.FallenPartsDestroyHeight + 25
+            for _, radius in ipairs({ 3.5, 6, 9, 13 }) do
+                for i = 1, count do
+                    -- bias to the horizontal band first (less likely inside floors)
+                    local y = 0.6 - 1.2 * ((i - 0.5) / count)
+                    local radial = math.sqrt(math.max(0, 1 - y * y))
+                    local angle = i * golden
+                    local spot = targetPart.Position
+                        + Vector3.new(math.cos(angle) * radial, y, math.sin(angle) * radial) * radius
+                    if spot.Y > minY and SpotFree(spot, model)
+                        and SpotFree(spot - Vector3.new(0, 1.5, 0), model) then
+                        peekParams.FilterDescendantsInstances = AAIgnoreList()
+                        local delta = targetPart.Position - spot
+                        local hit = workspace:Raycast(spot, delta * 1.02, peekParams)
+                        if hit and hit.Instance:IsDescendantOf(model) then
+                            return spot
+                        end
+                    end
+                end
+            end
+            return nil
+        end
+
+        local function EquippedGun()
+            local character = LocalPlayer.Character
+            local gun = character and character:FindFirstChildOfClass("Tool")
+            if not gun or gun:GetAttribute("ToolType") ~= "Gun" then return nil end
+            if (gun:GetAttribute("Local_ReloadSession") or 0) ~= 0 then return nil end
+            if (gun:GetAttribute("Local_CurrentAmmo") or 0) <= 0 then return nil end
+            return gun
+        end
+
+        -- Invisible peek (wallpen helper): only the SERVER body goes to the
+        -- peek spot. Your client body, camera and physics never move, so on
+        -- your screen nothing happens except the shots landing.
+        local function SetServerOverride(cf)
+            local env = (type(getgenv) == "function" and getgenv()) or _G
+            if type(env.AdvancedAASetOverride) == "function" then
+                pcall(env.AdvancedAASetOverride, cf)
+                return true
+            end
+            return false
+        end
+
+        local function RunPeek(target)
+            local character = LocalPlayer.Character
+            local root = character and character:FindFirstChild("HumanoidRootPart")
+            local head = character and character:FindFirstChild("Head")
+            local gun = EquippedGun()
+            local model = target and target:FindFirstAncestorOfClass("Model")
+            if not root or not head or not gun or not model then return end
+            local window = AASyncWindow()
+
+            local spot = FindPeekSpot(target, model)
+            if not spot then
+                PeekResolver.LastRun = os.clock() - PeekResolver.Cooldown * 0.5
+                return
+            end
+
+            PeekResolver.Busy = true
+            -- Server copy: head lands on the spot, facing the target.
+            local headOffset = AARealPartPosition(head) - AARealPartPosition(root)
+            local rootPos = spot - headOffset
+            local look = Vector3.new(target.Position.X, rootPos.Y, target.Position.Z)
+            local peekCF = (look - rootPos).Magnitude > 0.1 and CFrame.lookAt(rootPos, look)
+                or CFrame.new(rootPos)
+            if not SetServerOverride(peekCF) then
+                PeekResolver.Busy = false
+                return
+            end
+
+            local ok, err = pcall(function()
+                -- Wait until the server has the peek pose.
+                task.wait(window)
+                local deadline = os.clock() + PeekResolver.Hold
+                local lastShot = 0
+                while os.clock() < deadline and target.Parent and character.Parent do
+                    local hum = model:FindFirstChildOfClass("Humanoid")
+                    if not hum or hum.Health <= 0 then break end
+                    local liveGun = EquippedGun()
+                    if not liveGun then break end
+                    local rate = RapidFireEnabled and FireRate or (liveGun:GetAttribute("FireRate") or 0.1)
+                    if os.clock() - lastShot >= rate then
+                        -- Fire from the head the server sees (the peek spot).
+                        local origin = AAServerPartPosition(head)
+                        local plan = EvaluateShot(target, origin)
+                        local point = plan and plan.point or target.Position
+                        local part = plan and plan.FinalPart or target
+                        local shotOrigin = origin + (plan and plan.offset or Vector3.zero)
+                        local shots = {}
+                        for i = 1, liveGun:GetAttribute("ProjectileCount") or 1 do
+                            shots[i] = { shotOrigin, point, part }
+                        end
+                        lastShot = os.clock()
+                        -- Tracer from your real gun, so on your screen it
+                        -- looks like a normal wallbang.
+                        if TracerEnabled then CreateTracer(AARealPartPosition(head), point, Vector3.zero) end
+                        MarkShots(shots)
+                        Remotes.ShootEvent:FireServer(shots)
+                        liveGun:SetAttribute("Local_CurrentAmmo",
+                            (liveGun:GetAttribute("Local_CurrentAmmo") or 1) - 1)
+                    end
+                    task.wait()
+                end
+            end)
+
+            -- Always hand the server body back, even on error.
+            SetServerOverride(nil)
+            PeekResolver.LastRun = os.clock()
+            PeekResolver.Busy = false
+            if not ok then warn("peek resolver:", err) end
+        end
+
+        -- Target picker: closest enemy that the normal aim cannot hit.
+        task.spawn(function()
+            while true do
+                task.wait(0.1)
+                if not PeekResolver.Enabled or PeekResolver.Busy then continue end
+                if os.clock() - PeekResolver.LastRun < PeekResolver.Cooldown then continue end
+                if not EquippedGun() then continue end
+                local character = LocalPlayer.Character
+                local myHead = character and character:FindFirstChild("Head")
+                local myHum = character and character:FindFirstChildOfClass("Humanoid")
+                if not myHead or not myHum or myHum.Health <= 0 or myHum.Sit then continue end
+
+                local candidates = {}
+                for _, plr in Players:GetPlayers() do
+                    local priority = CombatPriority(plr)
+                    local model = plr.Character
+                    local head = model and model:FindFirstChild("Head")
+                    local hum = model and model:FindFirstChildOfClass("Humanoid")
+                    if priority and head and hum and hum.Health > 0
+                        and not model:FindFirstChildOfClass("ForceField") then
+                        local dist = (head.Position - myHead.Position).Magnitude
+                        if dist <= PeekResolver.Range then
+                            candidates[#candidates + 1] = { head = head, model = model,
+                                priority = priority, dist = dist }
+                        end
+                    end
+                end
+                table.sort(candidates, function(a, b)
+                    if a.priority ~= b.priority then return a.priority < b.priority end
+                    return a.dist < b.dist
+                end)
+
+                local realHead = AARealPartPosition(myHead)
+                local serverHead = AAServerPartPosition(myHead)
+                for i = 1, math.min(#candidates, 4) do
+                    local c = candidates[i]
+                    local underground = IsUnderground(c.model)
+                    if (not PeekResolver.OnlyUnderground or underground)
+                        and not EvaluateShot(c.head, realHead)
+                        and not EvaluateShot(c.head, serverHead) then
+                        RunPeek(c.head)
+                        break
+                    end
+                end
+            end
+        end)
+
+        local peekSection = Pages.CombatPage:Section({ Name = "peek resolver", Side = 1 })
+        peekSection:Toggle({ Name = "peek shot resolver", Flag = "peekresolver", Default = false,
+            Callback = function(v) PeekResolver.Enabled = v end })
+        peekSection:Toggle({ Name = "only underground targets", Flag = "peekresolver_ugonly", Default = true,
+            Callback = function(v) PeekResolver.OnlyUnderground = v end })
+        peekSection:Slider({ Name = "peek hold time (s)", Flag = "peekresolver_hold",
+            Min = 0.1, Max = 0.8, Default = 0.35, Decimals = 0.05,
+            Callback = function(v) PeekResolver.Hold = v end })
+        peekSection:Slider({ Name = "peek cooldown (s)", Flag = "peekresolver_cooldown",
+            Min = 0.3, Max = 5, Default = 1.5, Decimals = 0.1,
+            Callback = function(v) PeekResolver.Cooldown = v end })
+        peekSection:Slider({ Name = "peek range (studs)", Flag = "peekresolver_range",
+            Min = 25, Max = 600, Default = 300, Decimals = 5,
+            Callback = function(v) PeekResolver.Range = v end })
+    --#endregion
+
+
+
     --#region gun mods
 
         local shoot = filtergc("function", {Name = "shoot"}, true)
@@ -4730,6 +4966,32 @@ do
         return true
     end
 
+    -- Moves the whole body by `transform` for the server only (restored
+    -- before render, so the client never sees it).
+    local function applyTransform(character, root, transform, offset, destination)
+        local parts = AssemblyParts(character)
+        table.clear(savedPose)
+        for i = 1, #parts do
+            local part = parts[i]
+            if part.Parent then savedPose[part] = part.CFrame end
+        end
+        savedCharacter = character
+        savedRoot, savedExpected, savedOffset = root, destination, offset
+        displaced = true
+        for part, cf in pairs(savedPose) do
+            pcall(function() part.CFrame = transform * cf end)
+        end
+        serverTransform, serverOffset = transform, offset
+    end
+
+    -- Server-only root override (used by the invisible peek resolver). While
+    -- set, the server sees the root at this CFrame no matter what UG / pauses
+    -- / the failsafe are doing; the client body and camera stay put.
+    local overrideRoot = nil
+    env.AdvancedAASetOverride = function(cf)
+        if typeof(cf) == "CFrame" then overrideRoot = cf else overrideRoot = nil end
+    end
+
     -- Heartbeat: runs after physics, right before replication is sent.
     local applyServerPoseInner
     local function applyServerPose(dt)
@@ -4739,6 +5001,17 @@ do
     function applyServerPoseInner(dt)
         restorePose()
         clearServerPose()
+        if overrideRoot then
+            local character = LocalPlayer.Character
+            local root = character and character:FindFirstChild("HumanoidRootPart")
+            local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+            if root and humanoid and humanoid.Health > 0 then
+                local transform = overrideRoot * root.CFrame:Inverse()
+                applyTransform(character, root, transform,
+                    overrideRoot.Position - root.Position, overrideRoot.Position)
+            end
+            return
+        end
         if not settings.Enabled or promptHeld then return end
         local t = now()
         if t < pausedUntil or t < forceSyncUntil or t < peekUntil then return end
@@ -4781,19 +5054,7 @@ do
         -- Rotate around the root, then move straight down by the offset.
         local transform = CFrame.new(pivot + offset) * rotation * CFrame.new(-pivot)
 
-        local parts = AssemblyParts(character)
-        table.clear(savedPose)
-        for i = 1, #parts do
-            local part = parts[i]
-            if part.Parent then savedPose[part] = part.CFrame end
-        end
-        savedCharacter = character
-        savedRoot, savedExpected, savedOffset = root, destination, offset
-        displaced = true
-        for part, cf in pairs(savedPose) do
-            pcall(function() part.CFrame = transform * cf end)
-        end
-        serverTransform, serverOffset = transform, offset
+        applyTransform(character, root, transform, offset, destination)
     end
 
     add(RunService.Heartbeat:Connect(applyServerPose))
@@ -4887,6 +5148,8 @@ do
         env.AdvancedAAServerPosition = nil
         env.AdvancedAAUnshiftPosition = nil
         env.AdvancedAAShotState = nil
+        env.AdvancedAASetOverride = nil
+        overrideRoot = nil
         env.AdvancedAAPeek = nil
         env.AdvancedAASyncWindow = nil
     end
