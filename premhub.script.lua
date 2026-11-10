@@ -290,7 +290,6 @@
 --#endregion
 
 
-
 -- Shared team policy for aim, ESP and chams. Unknown teams fall back to
 -- same-team exclusion instead of guessing their role.
 local CurrentTargetPlayer, CurrentTargetTime = nil, 0
@@ -305,6 +304,28 @@ end
 
 local PriorityTeamCheck = true
 local AggroThreatRange = 80
+
+-- Player filter (see the "player filter" dropdowns in the aimbot section):
+-- whitelisted names are ignored by every combat feature (silent aim,
+-- ragebot, peek resolver, chams, hitbox hulls) while ESP still draws them;
+-- blacklisted names are forced to the top of every targeting pass, with
+-- everyone else still available when they are dead / gone.
+local WhitelistedPlayers = {}
+local BlacklistedPlayers = {}
+
+-- Targeting range, always 10 studs past the ESP draw distance: anything the
+-- aimbot locks on stays drawn by ESP. Reads the ESP library's live slider
+-- value through getgenv (it publishes itself there), the same bridge the
+-- advanced-aa settings use; the fallback matches the ESP default of 500.
+local function TargetingRange()
+    local env = (type(getgenv) == "function" and getgenv()) or _G
+    local lib = type(env.EspLib) == "table" and env.EspLib or nil
+    if lib and type(lib.Table) == "table" then
+        local dist = tonumber(lib.Table.Distance)
+        if dist and dist > 0 then return dist + 10 end
+    end
+    return 510
+end
 -- Role from the team name, memoised per Team instance: this runs several times
 -- per player per frame across the aim, ESP and chams code.
 local teamRoleCache = setmetatable({}, { __mode = "k" })
@@ -328,6 +349,8 @@ local function TeamRole(player)
 end
 local function TargetPriority(player)
     if not player or player == LocalPlayer then return nil end
+    if WhitelistedPlayers[player.Name] then return nil end
+    if BlacklistedPlayers[player.Name] then return -1 end
     if not PriorityTeamCheck then return 1 end
     local localRole, role = TeamRole(LocalPlayer), TeamRole(player)
     if localRole == "police" then
@@ -393,7 +416,8 @@ end
 local function CombatPriority(plr)
     if not plr or plr == LocalPlayer then return nil end
     local localRole, targetRole = TeamRole(LocalPlayer), TeamRole(plr)
-    if localRole == "police" and targetRole == "prisoner" and not IsHostilePrisoner(plr) then
+    if localRole == "police" and targetRole == "prisoner" and not IsHostilePrisoner(plr)
+        and not BlacklistedPlayers[plr.Name] then
         return nil
     end
     local priority = TargetPriority(plr)
@@ -495,6 +519,19 @@ local function AAPeek(seconds)
         return ok and granted == true
     end
     return false
+end
+
+-- Freeze the orbiting server pose at its current point for a moment. While
+-- square / prism moves the server position, a shot built from the current
+-- pose can arrive after the pose has already moved on, which the server
+-- reads as a bad origin: freezing holds the exact pose the shot was built
+-- from until the shot has been validated, so the aim keeps landing while
+-- the position-based AA is running.
+local function AAFreeze(seconds)
+    local env = (type(getgenv) == "function" and getgenv()) or _G
+    if type(env.AdvancedAAFreeze) == "function" then
+        pcall(env.AdvancedAAFreeze, seconds)
+    end
 end
 
 -- How long the server needs to receive a pose change (ping based).
@@ -627,7 +664,7 @@ local WallPen = {
     ShowMarker = true,
     -- Derived from the single budget slider below (percent of the full budget).
     Budget = 25,
-    MaxThickness = 1.25,
+    MaxThickness = 5,
     MaxLayers = 2,
     -- Panel readout of the most recent measurement.
     Last = { label = "idle", thickness = 0, layers = 0, time = 0 },
@@ -638,11 +675,15 @@ local WallPen = {
 }
 
 local WALLPEN_MIN_SPAN = 0.02
-local WALLPEN_FULL_THICKNESS = 5
-local WALLPEN_FULL_LAYERS = 6
+-- Full budget. The old ceiling (5 studs / 6 layers) was below a floor between
+-- storeys, so shooting someone on the level below was always "Blocked" and the
+-- raw aim just hit the floor. 20 studs also covers a baseplate-thick slab at
+-- 100%.
+local WALLPEN_FULL_THICKNESS = 20
+local WALLPEN_FULL_LAYERS = 8
 
 -- One slider owns both limits so the layer budget can never sit above what the
--- thickness budget allows: 25% = 1.25 studs / 2 layers, 100% = 5 studs / 6.
+-- thickness budget allows: 25% = 5 studs / 2 layers, 100% = 20 studs / 8.
 function WallPen.ApplyBudget(percent)
     local value = tonumber(percent) or 25
     local fraction = math.clamp(value / 100, 0.01, 1)
@@ -1379,9 +1420,7 @@ do -- combat
             end
 
     --#endregion
-    
-    
-    
+
     --#region manip 
 
         local _cachedoffset = nil
@@ -1463,6 +1502,9 @@ do -- combat
             local currentCamera = workspace.CurrentCamera
             if not currentCamera then return nil end
             local mouse = UserInputService:GetMouseLocation()
+            local myRoot = LocalPlayer.Character
+                and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+            local maxRange = TargetingRange()
             local bestPart, bestPriority, bestDistance = nil, math.huge, math.huge
             for _, plr in Players:GetPlayers() do
                 local priority = CombatPriority(plr)
@@ -1471,6 +1513,8 @@ do -- combat
                 local hum = model and model:FindFirstChildOfClass("Humanoid")
                 if not priority or not head or not hum or hum.Health <= 0
                     or model:FindFirstChildOfClass("ForceField") then continue end
+                -- Past the ESP draw distance (+10): not a target.
+                if myRoot and (head.Position - myRoot.Position).Magnitude > maxRange then continue end
                 local position, onScreen = currentCamera:WorldToViewportPoint(head.Position)
                 if not onScreen or position.Z <= 0 then continue end
                 local distance = (Vector2.new(position.X, position.Y) - mouse).Magnitude
@@ -1482,7 +1526,6 @@ do -- combat
             if SilentAimEnabled then ReportTarget(bestPart) end
             return bestPart
         end
-
 
 
         local visparams = RaycastParams.new()
@@ -1624,6 +1667,13 @@ do -- combat
             return nil
         end
 
+        -- NOTE: there is deliberately no "blind claim" fallback any more.
+        -- The game only registers a shot that has a real line from the pose
+        -- the SERVER holds - claiming a part with no line just produced
+        -- another invalid, and the misses fed the failsafe until it dropped
+        -- UG for nothing. When the server pose cannot see the target, the
+        -- callers peek, queue behind a peek, or hold fire instead.
+
         -- `originOverride` is the head the shot will actually be fired from.
         -- Evaluating from one head and firing from another is what produced
         -- most UG misses (line checked from above ground, bullet sent from
@@ -1636,7 +1686,10 @@ do -- combat
             end
 
             local origin = originOverride or AARealPartPosition(LocalHead)
-            local range = Gun:GetAttribute("Range") or math.huge
+            -- Gun range and the ESP-based targeting range, whichever is
+            -- shorter, so nobody outside the ESP draw distance (+10) is
+            -- ever picked up here either.
+            local range = math.min(Gun:GetAttribute("Range") or math.huge, TargetingRange())
             local currentCamera = workspace.CurrentCamera
             local facing = currentCamera and currentCamera.CFrame.LookVector
                 or LocalHead.CFrame.LookVector
@@ -1766,9 +1819,13 @@ do -- combat
 
         -- Fires a silent-aim shot once the server pose has settled (transition
         -- finished or the peek has landed), re-evaluated from that exact pose.
+        -- When the pose the server holds cannot see the target it keeps
+        -- asking for a peek (waiting out the peek cooldown if needed) and
+        -- fires from the real head as soon as the server has it. If the peek
+        -- never comes the shot is dropped instead of fired as an invalid.
         local function QueueSilentShot(Args, Target)
             task.spawn(function()
-                local deadline = os.clock() + 0.6
+                local deadline = os.clock() + 1.0
                 while os.clock() < deadline do
                     local state = AAShotState()
                     if state ~= "transition" then
@@ -1787,7 +1844,16 @@ do -- combat
                                     v[3] = plan.FinalPart
                                 end
                             end
-                            if state == "real" then AAPeek(AASyncWindow() + 0.1) end
+                            if state == "server" then
+                                -- Orbiting pose: freeze it for the FULL
+                                -- one-way latency so the shot is still
+                                -- validated against the exact pose it was
+                                -- built from when it reaches the server
+                                -- (see AAFreeze).
+                                AAFreeze(math.clamp(AASyncWindow(), 0.08, 0.3))
+                            else
+                                AAPeek(AASyncWindow() + 0.1)
+                            end
                             MarkShots(Args[1])
                             Remotes.ShootEvent:FireServer(table.unpack(Args))
                             if state == "server" then
@@ -1796,8 +1862,17 @@ do -- combat
                             end
                             return
                         end
-                        -- Underground head still blocked: wait for the peek.
-                        if state == "real" then return end
+                        if state == "server" then
+                            -- The pose the server holds has no line: ask for a
+                            -- peek. AAPeek returns false while peeking is off
+                            -- or cooling down - the loop just keeps waiting,
+                            -- because firing now would be a guaranteed
+                            -- invalid.
+                            AAPeek(AASyncWindow() * 2 + 0.15)
+                        else
+                            -- Real pose cannot see the target either: drop.
+                            return
+                        end
                     end
                     task.wait()
                 end
@@ -1831,10 +1906,12 @@ do -- combat
                         if state == "server" then
                             origin = serverOrigin
                             plan = EvaluateShot(Target, serverOrigin)
-                            if not plan and EvaluateShot(Target, realOrigin)
-                                and AAPeek(AASyncWindow() * 2 + 0.15) then
-                                -- Underground head has no line but the real one
-                                -- does: peek and fire once the server has it.
+                            if not plan and EvaluateShot(Target, realOrigin) then
+                                -- Underground head has no line but the real
+                                -- one does: queue it. QueueSilentShot grabs
+                                -- the peek itself (waiting out the cooldown
+                                -- if it has to) and fires from the real head
+                                -- as soon as the server has it.
                                 queue = true
                             end
                         elseif state == "real" then
@@ -1860,15 +1937,26 @@ do -- combat
                                 v[3] = plan.FinalPart
                             end
                             if state == "server" then
+                                -- Orbiting pose: with smooth shots on this
+                                -- is a no-op (the orbit keeps running); with
+                                -- it off, freeze the pose for the full
+                                -- one-way latency so the shot is validated
+                                -- against the exact pose it was built from
+                                -- (see AAFreeze).
+                                AAFreeze(math.clamp(AASyncWindow(), 0.08, 0.3))
                                 local hitModel = plan.FinalPart and plan.FinalPart:FindFirstAncestorOfClass("Model")
                                 FailsafeWatch(hitModel and Players:GetPlayerFromCharacter(hitModel))
                             end
                         elseif state == "server" then
-                            -- No plan: still send it from the pose the server
-                            -- holds so it is a plain miss, not an invalid.
-                            for _, v in Args[1] do
-                                if type(v) == "table" then v[1] = serverOrigin end
-                            end
+                            -- No line from the pose the server holds and the
+                            -- real head cannot see the target either (or the
+                            -- peek is disabled): any origin sent now is
+                            -- either wrong (real pose -> invalid) or blocked
+                            -- (server pose -> dropped shot), so the shot is
+                            -- held instead of firing another invalid. The
+                            -- peek / peek resolver makes the target hittable.
+                            setnamecallmethod(namecallmethod)
+                            return nil
                         end
                     end
                 end
@@ -1941,15 +2029,25 @@ do -- combat
                     origin = AAServerPartPosition(LocalHead)
                     t = GetVisibleTarget(Gun, origin)
                     if not t then
-                        -- Underground head has no line. If the real head does,
-                        -- peek: the next shots come from the real pose once the
-                        -- server has it, then UG returns.
+                        -- Underground head has no line. If the real head
+                        -- does, peek: the next shots come from the real pose
+                        -- once the server has it, then UG returns. When the
+                        -- peek is unavailable (off / cooling down) fire is
+                        -- HELD for this tick - shooting from the underground
+                        -- pose is a guaranteed invalid, and the miss streak
+                        -- would trip the failsafe and drop UG for nothing.
                         local realHead = AARealPartPosition(LocalHead)
                         if GetVisibleTarget(Gun, realHead) then
                             AAPeek(AASyncWindow() * 2 + 0.15)
                         end
                         continue
                     end
+                    -- Orbiting pose: with smooth shots on this is a no-op
+                    -- (the orbit keeps running); with it off, freeze it at
+                    -- this point while the shot is in flight so the server
+                    -- validates the exact origin it was built from (see
+                    -- AAFreeze).
+                    AAFreeze(math.clamp(AASyncWindow(), 0.08, 0.3))
                 else
                     origin = AARealPartPosition(LocalHead)
                     t = GetVisibleTarget(Gun, origin)
@@ -1986,15 +2084,29 @@ do -- combat
     --#endregion
 
 
-
     --#region peek shot / underground resolver
         -- For targets nothing else can hit (underground cheaters, or anyone
-        -- with no line from either of our heads): teleport to a spot that has
-        -- a clear line to them, fire, and teleport straight back. The whole
-        -- trip is ~ping + hold time + ping, well under a second.
+        -- with no line from either of our heads): teleport the SERVER pose
+        -- to a calculated safe spot, fire, and teleport straight back. The
+        -- client body never moves - you do not see anything except the
+        -- shots landing. The whole trip is ~ping + hold time + ping, well
+        -- under a second.
+        --
+        -- Spot picking order (the safety-calculation part):
+        --   1. BELOW the target, under the floor: the slab between the two
+        --      of you blocks their ray entirely (their aimbot's visibility
+        --      check fails, so they cannot lock on), while our shot wallbangs
+        --      straight up through it.
+        --   2. To the SIDE, behind cover: no clear ray from their head to
+        --      the spot, and the same cover is thin enough for our wallbang.
+        --   3. (opt-in "open peek") the old behaviour - any free spot with a
+        --      clear line, exposed to return fire.
+        -- No safe + viable spot -> no peek: better to hold position than to
+        -- teleport into their gun.
         local PeekResolver = {
             Enabled = false,
             OnlyUnderground = true,
+            OpenPeek = false,
             Hold = 0.35,
             Cooldown = 1.5,
             Range = 300,
@@ -2041,26 +2153,114 @@ do -- combat
             return true
         end
 
-        -- Head position near the target with free space and a clear line.
+        -- Enemy retaliation check: can they hit a spot? A spot is only safe
+        -- when NO clear ray exists from their head / eye height to it, so
+        -- their aimbot's visibility check (raycast to the head) fails and
+        -- they cannot lock on while we stand there. Blocked = cover in the
+        -- way = they have to wallbang us blind to retaliate.
+        local function SpotSafe(spot, model)
+            local head = model and model:FindFirstChild("Head")
+            if not head then return false end
+            peekParams.FilterDescendantsInstances = PeekIgnore(model)
+            for _, lift in ipairs({ 0, 1.5, 3 }) do
+                local origin = head.Position + Vector3.new(0, lift, 0)
+                local delta = spot - origin
+                if delta.Magnitude > 0.5
+                    and not workspace:Raycast(origin, delta, peekParams) then
+                    return false
+                end
+            end
+            return true
+        end
+
+        -- Underground targets hide their real body above ground: their
+        -- camera ray has to come DOWN through the floor to reach us, so any
+        -- spot that is itself covered from above is safe against them.
+        local function SpotSafeUnderground(spot, model)
+            peekParams.FilterDescendantsInstances = PeekIgnore(model)
+            return workspace:Raycast(spot, Vector3.new(0, 60, 0), peekParams) ~= nil
+        end
+
+        -- Can our shot reach the target from this spot? Wallbang counts: the
+        -- peek forces wallpen on for its own evaluation, so cover that is
+        -- penetrable within the budget (the floor between us, a wall to the
+        -- side) is a valid peek, not a rejection.
+        local function SpotViable(targetPart, spot)
+            local saved = WallPen.Enabled
+            WallPen.Enabled = true
+            local ok, plan = pcall(EvaluateShot, targetPart, spot)
+            WallPen.Enabled = saved
+            return ok and plan ~= nil
+        end
+
+        -- Peek spot picker. Order of preference:
+        --   1. BELOW the target (under the floor) - the slab blocks their
+        --      ray entirely, our shot wallbangs up through it.
+        --   2. To the SIDE, behind cover - no clear ray from their head,
+        --      our wallbang punches through the same cover.
+        --   3. (last resort, "open peek" toggle) any free spot with a clear
+        --      line - the old behaviour, exposed to return fire.
         local function FindPeekSpot(targetPart, model)
+            local targetPos = targetPart.Position
+            local minY = workspace.FallenPartsDestroyHeight + 25
+            local underground = IsUnderground(model)
+
+            -- 1) Below them: progressively deeper until under the slab.
+            for _, d in ipairs({ 4, 6, 8, 11, 14 }) do
+                local spot = targetPos - Vector3.new(0, d, 0)
+                if spot.Y > minY and SpotFree(spot, model)
+                    and (underground or SpotSafe(spot, model))
+                    and SpotViable(targetPart, spot) then
+                    return spot
+                end
+            end
+
+            -- 2) Sides: ring around them, biased to below their head height
+            --    (floor level is where cover lives). Only spots their head
+            --    cannot see straight into.
             local golden = math.pi * (3 - math.sqrt(5))
             local count = 24
-            local minY = workspace.FallenPartsDestroyHeight + 25
-            for _, radius in ipairs({ 3.5, 6, 9, 13 }) do
+            local viableTries = 0
+            local safeCheck = underground and SpotSafeUnderground or SpotSafe
+            for _, radius in ipairs({ 4, 7, 10, 14 }) do
                 for i = 1, count do
-                    -- bias to the horizontal band first (less likely inside floors)
-                    local y = 0.6 - 1.2 * ((i - 0.5) / count)
+                    local y = -0.4 - 1.2 * ((i - 0.5) / count)
                     local radial = math.sqrt(math.max(0, 1 - y * y))
                     local angle = i * golden
-                    local spot = targetPart.Position
+                    local spot = targetPos
                         + Vector3.new(math.cos(angle) * radial, y, math.sin(angle) * radial) * radius
                     if spot.Y > minY and SpotFree(spot, model)
-                        and SpotFree(spot - Vector3.new(0, 1.5, 0), model) then
-                        peekParams.FilterDescendantsInstances = AAIgnoreList()
-                        local delta = targetPart.Position - spot
-                        local hit = workspace:Raycast(spot, delta * 1.02, peekParams)
-                        if hit and hit.Instance:IsDescendantOf(model) then
+                        and SpotFree(spot - Vector3.new(0, 1.5, 0), model)
+                        and safeCheck(spot, model) then
+                        viableTries += 1
+                        if SpotViable(targetPart, spot) then
                             return spot
+                        end
+                        -- Bound the cost: cover this thick / this many
+                        -- candidates is enough for any real position.
+                        if viableTries >= 16 then break end
+                    end
+                end
+                if viableTries >= 16 then break end
+            end
+
+            -- 3) Open peek (opt-in last resort): the old clear-line search.
+            if PeekResolver.OpenPeek then
+                for _, radius in ipairs({ 3.5, 6, 9, 13 }) do
+                    for i = 1, count do
+                        local y = 0.6 - 1.2 * ((i - 0.5) / count)
+                        local radial = math.sqrt(math.max(0, 1 - y * y))
+                        local angle = i * golden
+                        local spot = targetPos
+                            + Vector3.new(math.cos(angle) * radial, y, math.sin(angle) * radial) * radius
+                        if spot.Y > minY and SpotFree(spot, model)
+                            and SpotFree(spot - Vector3.new(0, 1.5, 0), model) then
+                            peekParams.FilterDescendantsInstances = AAIgnoreList()
+                            local delta = targetPart.Position - spot
+                            local hit = workspace:Raycast(spot, delta * 1.02, peekParams)
+                            if hit and hit.Instance:IsDescendantOf(model) then
+                                return spot
+                            end
                         end
                     end
                 end
@@ -2116,6 +2316,13 @@ do -- combat
                 return
             end
 
+            -- The peek lives off wallbangs (below the floor / behind cover),
+            -- so wallpen is forced on for the shots fired from the spot even
+            -- when the main toggle is off. Restored no matter how the peek
+            -- ends.
+            local savedWallPen = WallPen.Enabled
+            WallPen.Enabled = true
+
             local ok, err = pcall(function()
                 -- Wait until the server has the peek pose.
                 task.wait(window)
@@ -2131,27 +2338,33 @@ do -- combat
                         -- Fire from the head the server sees (the peek spot).
                         local origin = AAServerPartPosition(head)
                         local plan = EvaluateShot(target, origin)
-                        local point = plan and plan.point or target.Position
-                        local part = plan and plan.FinalPart or target
-                        local shotOrigin = origin + (plan and plan.offset or Vector3.zero)
-                        local shots = {}
-                        for i = 1, liveGun:GetAttribute("ProjectileCount") or 1 do
-                            shots[i] = { shotOrigin, point, part }
+                        if plan then
+                            local shotOrigin = origin + plan.offset
+                            local shots = {}
+                            for i = 1, liveGun:GetAttribute("ProjectileCount") or 1 do
+                                shots[i] = { shotOrigin, plan.point, plan.FinalPart }
+                            end
+                            lastShot = os.clock()
+                            -- Tracer from your real gun, so on your screen it
+                            -- looks like a normal wallbang.
+                            if TracerEnabled then
+                                CreateTracer(AARealPartPosition(head), plan.point, Vector3.zero)
+                            end
+                            MarkShots(shots)
+                            Remotes.ShootEvent:FireServer(shots)
+                            liveGun:SetAttribute("Local_CurrentAmmo",
+                                (liveGun:GetAttribute("Local_CurrentAmmo") or 1) - 1)
                         end
-                        lastShot = os.clock()
-                        -- Tracer from your real gun, so on your screen it
-                        -- looks like a normal wallbang.
-                        if TracerEnabled then CreateTracer(AARealPartPosition(head), point, Vector3.zero) end
-                        MarkShots(shots)
-                        Remotes.ShootEvent:FireServer(shots)
-                        liveGun:SetAttribute("Local_CurrentAmmo",
-                            (liveGun:GetAttribute("Local_CurrentAmmo") or 1) - 1)
+                        -- No plan (they moved / cover shifted): hold fire for
+                        -- this tick instead of shooting the floor between us.
                     end
                     task.wait()
                 end
             end)
 
-            -- Always hand the server body back, even on error.
+            -- Always hand the server body back, even on error - and put the
+            -- wallpen toggle back exactly as the user had it.
+            WallPen.Enabled = savedWallPen
             SetServerOverride(nil)
             PeekResolver.LastRun = os.clock()
             PeekResolver.Busy = false
@@ -2169,6 +2382,34 @@ do -- combat
                 local myHead = character and character:FindFirstChild("Head")
                 local myHum = character and character:FindFirstChildOfClass("Humanoid")
                 if not myHead or not myHum or myHum.Health <= 0 or myHum.Sit then continue end
+
+                local realHead = AARealPartPosition(myHead)
+                local serverHead = AAServerPartPosition(myHead)
+
+                -- Silent FOV has priority: while the silent aim has a target
+                -- inside the FOV circle, the resolver only ever peeks FOR
+                -- that target, and only when nothing normal can hit it. It
+                -- never teleports the server pose for someone else mid-fight
+                -- while the user is engaging. With no silent target it falls
+                -- back to the ragebot behaviour (closest unhittable enemy),
+                -- so the resolver and the ragebot keep cooperating.
+                if SilentAimEnabled then
+                    local fovTarget = GetTarget()
+                    if fovTarget then
+                        local fovModel = fovTarget:FindFirstAncestorOfClass("Model")
+                        local fovHum = fovModel and fovModel:FindFirstChildOfClass("Humanoid")
+                        if fovHum and fovHum.Health > 0 then
+                            local dist = (fovTarget.Position - myHead.Position).Magnitude
+                            if dist <= PeekResolver.Range
+                                and (not PeekResolver.OnlyUnderground or IsUnderground(fovModel))
+                                and not EvaluateShot(fovTarget, realHead)
+                                and not EvaluateShot(fovTarget, serverHead) then
+                                RunPeek(fovTarget)
+                            end
+                        end
+                        continue
+                    end
+                end
 
                 local candidates = {}
                 for _, plr in Players:GetPlayers() do
@@ -2190,8 +2431,6 @@ do -- combat
                     return a.dist < b.dist
                 end)
 
-                local realHead = AARealPartPosition(myHead)
-                local serverHead = AAServerPartPosition(myHead)
                 for i = 1, math.min(#candidates, 4) do
                     local c = candidates[i]
                     local underground = IsUnderground(c.model)
@@ -2210,6 +2449,9 @@ do -- combat
             Callback = function(v) PeekResolver.Enabled = v end })
         peekSection:Toggle({ Name = "only underground targets", Flag = "peekresolver_ugonly", Default = true,
             Callback = function(v) PeekResolver.OnlyUnderground = v end })
+        peekSection:Toggle({ Name = "open peek (last resort, risky)", Flag = "peekresolver_openpeek",
+            Default = false,
+            Callback = function(v) PeekResolver.OpenPeek = v end })
         peekSection:Slider({ Name = "peek hold time (s)", Flag = "peekresolver_hold",
             Min = 0.1, Max = 0.8, Default = 0.35, Decimals = 0.05,
             Callback = function(v) PeekResolver.Hold = v end })
@@ -2220,7 +2462,6 @@ do -- combat
             Min = 25, Max = 600, Default = 300, Decimals = 5,
             Callback = function(v) PeekResolver.Range = v end })
     --#endregion
-
 
 
     --#region gun mods
@@ -2379,8 +2620,8 @@ do -- combat
         -- One slider owns the whole penetration budget: it scales the wall
         -- thickness and the layer count together, so the layer limit can never
         -- sit above what the thickness limit allows.
-        --    25%  = 1.25 studs / 2 layers   (default)
-        --    100% = 5.00 studs / 6 layers
+        --    25%  = 5.00 studs / 2 layers   (default)
+        --    100% = 20.0 studs / 8 layers
         Sections.aimbot:Slider({
             Name = "wallpen max (walls + layers)"; Flag = "wallpen_max";
             Min = 1; Max = 100; Default = 25; Decimals = 1;
@@ -2408,6 +2649,52 @@ do -- combat
                 AimState.Ragebot = v;
             end 
         })
+
+        do -- player filter
+            local function PlayerNameList()
+                local names = {}
+                for _, plr in ipairs(Players:GetPlayers()) do
+                    if plr ~= LocalPlayer then names[#names + 1] = plr.Name end
+                end
+                table.sort(names)
+                return names
+            end
+
+            -- Whitelist: never aimed at by anything, ESP still draws them.
+            -- Blacklist: forced top priority, everyone else stays available
+            -- as a fallback when they are dead / gone.
+            local whitelistDrop = Sections.aimbot:Dropdown({
+                Name = 'whitelist (never aim)';
+                Flag = 'playerwhitelist';
+                Items = PlayerNameList();
+                Multi = true;
+                Default = {};
+                Callback = function(v)
+                    table.clear(WhitelistedPlayers)
+                    for _, name in ipairs(v) do WhitelistedPlayers[name] = true end
+                end;
+            })
+            local blacklistDrop = Sections.aimbot:Dropdown({
+                Name = 'blacklist (priority)';
+                Flag = 'playerblacklist';
+                Items = PlayerNameList();
+                Multi = true;
+                Default = {};
+                Callback = function(v)
+                    table.clear(BlacklistedPlayers)
+                    for _, name in ipairs(v) do BlacklistedPlayers[name] = true end
+                end;
+            })
+
+            local function RefreshPlayerLists()
+                whitelistDrop:Refresh(PlayerNameList())
+                blacklistDrop:Refresh(PlayerNameList())
+            end
+            Players.PlayerAdded:Connect(RefreshPlayerLists)
+            Players.PlayerRemoving:Connect(function()
+                task.defer(RefreshPlayerLists)
+            end)
+        end
 
 
         Sections.gunmods:Toggle({
@@ -2463,12 +2750,11 @@ do -- combat
 end 
 
 
-
 -- Apply shared policy after the external ESP library has positioned its holders.
 RunService:BindToRenderStep("PriorityESPFilter", Enum.RenderPriority.Camera.Value + 2, function()
     if not PriorityTeamCheck or not EspLib.Cache then return end
     for plr, entry in pairs(EspLib.Cache) do
-        if not TargetPriority(plr) and entry.Holder then
+        if not TargetPriority(plr) and not WhitelistedPlayers[plr.Name] and entry.Holder then
             entry.Holder.Visible = false
             -- Keep the library's visibility state consistent so it can show it again.
             entry.Visible = false
@@ -2593,7 +2879,7 @@ do -- esp
             Sections.Esp:Label({Name = i})
 
             Sections.Esp:Label({Name = 'mid'}):Colorpicker({
-                Name = 'mid color';
+                Name = 'mid';
                 Flag = 'barmidcolor'..i;
                 Default = v['Mid'];
                 Callback = function(dih)
@@ -2947,7 +3233,7 @@ RunService.RenderStepped:Connect(function(delta)
     if not Ghost.Parent then return end
 
     local character = GhostCharacter
-    local root = character:FindFirstChild("HumanoidRootPart")
+    local root = character and character:FindFirstChild("HumanoidRootPart")
 
     if not root then return end
 
@@ -3327,6 +3613,7 @@ UserInputService.InputChanged:Connect(function(input)
         )
     end
 end)
+
 
 -- ==========================================
 -- PLAYER TRACKING
@@ -4244,7 +4531,7 @@ Sections.visuals:Toggle({
             Default = false;
             Callback = function(v)
                 FullbrightEnabled = v;
-            end
+            end 
         })
 
         Sections.visuals:Label({Name = 'ambient'}):Colorpicker({
@@ -4296,7 +4583,7 @@ Sections.visuals:Toggle({
             Default = false;
             Callback = function(v)
                 NoFogEnabled = v;
-            end
+            end 
         })
 
         Sections.visuals:Toggle({ 
@@ -4357,7 +4644,6 @@ Sections.visuals:Toggle({
         })]]
     --#endregion toggles
 end 
-
 
 
 do -- misc
@@ -4688,13 +4974,47 @@ Sections.movement:Toggle({
 end 
 
 
-
-
 -- Advanced AA / underground.
 --
+-- Anti-ESP character spoof ("anti esp" toggle):
+--   * The pose every OTHER client reads (ESP box, chams, their aimbot's
+--     target position) is the pose the server holds - and this script owns
+--     that pose. The spoof pushes it far away in a random horizontal
+--     direction (re-rolled on a timer) AND under the map, so enemy ESP
+--     draws the wrong position and enemy aimbots that check visibility
+--     (raycast to the head) never lock on. Client-side, our own body and
+--     camera stay exactly where they are.
+--   * Our own aim compensates automatically: shots are built from the
+--     spoofed pose through the peek machinery, exactly like underground -
+--     we keep hitting them while they cannot hit us. Square / prism can be
+--     combined with it and then orbit around the spoofed centre.
+--
+-- Position-based shapes (square / prism):
+--   * Square walks the server position around a square loop in the XZ
+--     plane (range = size, speed = how fast it orbits), clockwise.
+--   * Prism walks it around a clockwise triangular loop in the XZ plane.
+--   * The paths NEVER move Y. The height slider is the only vertical
+--     offset (a constant lift above the real position). Safe footing
+--     searches nearby outline points / shorter steps only - no vertical
+--     hop any more.
+--   * Shots fired while the pose orbits are built from the pose the server
+--     holds at fire time; pose replication and the gun remote share the
+--     same one-way latency, so that is still the pose the server holds
+--     when the shot arrives - the orbit NEVER pauses for gunfire
+--     ("smooth shots", default on). Optional stable mode freezes the pose
+--     per shot instead (rock-solid validation, but the pose sits still
+--     while firing).
+--
 -- Desync order (per frame):
---   physics -> Heartbeat: save the real pose, move the body to the fake
+--   physics -> PostSimulation: save the real pose, move the body to the fake
 --              (server) pose. Replication sends THIS pose to the server.
+--   Heartbeat: the fake pose is asserted again. The engine's character
+--              update flush point has moved between versions; covering
+--              both post-physics windows is what makes the server actually
+--              HOLD the displaced pose (a Heartbeat-only build left it
+--              alive solely in the idle gap between frames, so the server
+--              only ever saw the real pose: square / prism looked dead and
+--              underground shots went invalid).
 --   next frame, RenderStep First (before the camera): put the real pose back.
 --   PreSimulation: safety restore, so physics only ever simulates the real
 --              pose.
@@ -4725,8 +5045,24 @@ do
         SafeFooting = true,
         HorizontalUG = true,
         ShotPeek = true,
+        -- Smooth shots: the orbit NEVER pauses for gunfire. Shot origins are
+        -- built from the pose the server holds at fire time - which, since
+        -- pose replication and the gun remote share the same one-way
+        -- latency, is still the pose the server holds when the shot arrives.
+        -- No freeze needed, so the AA runs at full slider speed while
+        -- shooting. Turn this OFF to fall back to the shot-pose freeze
+        -- (rock-solid validation, but the pose sits still while firing).
+        SmoothShots = true,
+        -- Anti-ESP character spoof (HvH): displaces the pose everyone ELSE
+        -- reads far away in a random horizontal direction and under the map,
+        -- so enemy ESP draws the wrong box and their aimbot's visibility
+        -- check (raycast to the head) always fails. Our own aim compensates
+        -- through the regular bridges, so we can still target them.
+        AntiESP = false,
+        AntiESPDistance = 60,
+        AntiESPReroll = 3,
         Range = 4,
-        Height = 4,
+        Height = 0,
         UndergroundDepth = 20,
         Speed = 4,
     }
@@ -4777,6 +5113,9 @@ do
     local pausedUntil = 0
     local forceSyncUntil = 0
     local promptHeld = false
+    -- Last offset actually applied (used to glide blocked-spot corrections
+    -- instead of teleporting between safe-footing candidates).
+    local smoothedOffset = nil
     local connections = {}
     local renderKey = "AdvancedAA_Restore_" .. tostring(LocalPlayer.UserId)
 
@@ -4788,6 +5127,8 @@ do
     -- Shot peek state.
     local peekUntil, peekStart, peekEndedAt = 0, 0, 0
     local PEEK_MAX, PEEK_COOLDOWN = 0.8, 0.4
+    -- Shot-pose freeze state (see AdvancedAAFreeze below).
+    local freezeUntil, frozenRootCF = 0, nil
 
     local function syncWindow()
         local ok, ping = pcall(function() return LocalPlayer:GetNetworkPing() end)
@@ -4866,6 +5207,34 @@ do
         return true
     end
 
+    -- Freeze the orbiting server pose at its current point for a moment.
+    -- Only used when "smooth shots" is OFF: with it on, shot origins are
+    -- built from the live pose at fire time and validated against the pose
+    -- the server holds when the shot arrives (same one-way latency), so the
+    -- orbit never has to stop for gunfire. The freeze remains as the
+    -- stable-mode fallback: it re-asserts the exact pose the shot was built
+    -- from (absolute, so walking does not slide it) until the shot has been
+    -- validated. UG never needs it: its pose is static already.
+    env.AdvancedAAFreeze = function(seconds)
+        if not settings.Enabled or settings.Underground or settings.SmoothShots then
+            return false
+        end
+        local character = LocalPlayer.Character
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        if not root then return false end
+        if displaced then
+            -- Body is currently IN the server pose: hold it where it stands.
+            frozenRootCF = root.CFrame
+        elseif serverTransform then
+            -- Body is in the real pose: capture the pose the server holds.
+            frozenRootCF = serverTransform * root.CFrame
+        else
+            return false
+        end
+        freezeUntil = math.max(freezeUntil, now() + (seconds or 0.15))
+        return true
+    end
+
     env.AdvancedAAPause = pauseAA
     env.AdvancedAAForceSync = forceSync
     env.AdvancedAAStatus = function()
@@ -4921,6 +5290,8 @@ do
     end))
 
     local function square(t)
+        -- Traces the perimeter of a square (side 2, centred on the origin)
+        -- in the XZ plane, clockwise. t in [0, 1) is one full loop.
         local p = (t % 1) * 4
         local edge = math.floor(p)
         local v = -1 + 2 * (p - edge)
@@ -4930,19 +5301,71 @@ do
         return Vector3.new(-1, 0, -v)
     end
 
+    -- Clockwise equilateral triangle (circumscribed radius 1) in the XZ
+    -- plane: north -> south-east -> south-west -> back to north, the same
+    -- winding direction as the square.
+    local TRIANGLE_VERTICES = {
+        Vector3.new(0, 0, -1),
+        Vector3.new(0.8660254, 0, 0.5),
+        Vector3.new(-0.8660254, 0, 0.5),
+    }
+    local function triangle(t)
+        local p = (t % 1) * 3
+        local edge = math.floor(p)
+        local v0 = TRIANGLE_VERTICES[edge + 1]
+        local v1 = TRIANGLE_VERTICES[(edge + 1) % 3 + 1]
+        return v0:Lerp(v1, p - edge)
+    end
+
+    -- Anti-ESP spoof offset: a random horizontal direction, re-rolled every
+    -- AntiESPReroll seconds, pushed under the map (so enemy raycast checks
+    -- to the head always fail) and far away (so their ESP box and distance
+    -- read nonsense). Under the floor the pose is invisible to every
+    -- visibility-gated aimbot, which is what "they can't target you" is.
+    local antiESPDir = Vector3.new(1, 0, 0)
+    local antiESPRerollAt = 0
+    local function AntiESPDirection()
+        if now() > antiESPRerollAt then
+            local angle = math.random() * math.pi * 2
+            antiESPDir = Vector3.new(math.cos(angle), 0, math.sin(angle))
+            antiESPRerollAt = now() + math.max(settings.AntiESPReroll, 0.5)
+        end
+        return antiESPDir
+    end
+
     local function calculateOffset(t)
+        -- Anti-ESP character spoof: everything other clients see (ESP box,
+        -- chams, their aimbot's target position) follows the pose the server
+        -- holds, so displacing it far away and under the map breaks their
+        -- lock. Our own shots are built from this pose too and flow through
+        -- the peek machinery, so we keep hitting them while spoofed.
+        local spoof = Vector3.zero
+        if settings.AntiESP then
+            spoof = AntiESPDirection() * math.clamp(settings.AntiESPDistance, 5, 500)
+            if not settings.Underground then
+                spoof += Vector3.new(0, -math.clamp(settings.UndergroundDepth, 1, 30), 0)
+            end
+        end
         -- UG is a pure vertical move: X and Z are always 0, the depth slider
-        -- is the only thing that changes it.
+        -- is the only thing that changes it. (With anti-esp on it stacks the
+        -- horizontal spoof on top of the drop.)
         if settings.Underground then
-            return Vector3.new(0, -math.clamp(settings.UndergroundDepth, 1, 30), 0)
+            return spoof + Vector3.new(0, -math.clamp(settings.UndergroundDepth, 1, 30), 0)
         end
-        local horizontal = Vector3.zero
-        if settings.Square or settings.Prism then horizontal = square(t) * settings.Range end
-        local height = 0
+        -- Square / prism are HORIZONTAL shapes: they only move X and Z, so
+        -- the server position orbits around the real position at the same
+        -- height. Y is owned by the height slider alone (a constant lift),
+        -- never by the path itself. With anti-esp on, the shape orbits
+        -- around the spoofed centre instead of the real position.
+        local shape
         if settings.Prism then
-            height = (1 - math.abs(2 * ((t * 0.5) % 1) - 1)) * settings.Height
+            shape = triangle(t)
+        elseif settings.Square then
+            shape = square(t)
+        else
+            return spoof
         end
-        return horizontal + Vector3.new(0, height, 0)
+        return spoof + shape * settings.Range + Vector3.new(0, math.max(settings.Height, 0), 0)
     end
 
     -- Safe footing for square / prism: the server pose must not end up
@@ -4965,6 +5388,16 @@ do
         end
         return true
     end
+
+    -- Safe-footing search order, used when the exact path point is blocked:
+    -- nearby points on the same square / prism outline first (keeps the
+    -- motion on the shape), then progressively shorter steps along the same
+    -- direction. There is deliberately no vertical fallback: the shapes own
+    -- X/Z, the height slider owns Y, and when even the shortest step is
+    -- blocked the pose simply holds still for that frame (a still pose is
+    -- always safe to shoot from).
+    local SAFE_PATH_SHIFTS = { 0.06, -0.06, 0.13, -0.13, 0.28, -0.28, 0.5, -0.5 }
+    local SAFE_PATH_SCALES = { 0.8, 0.6, 0.45, 0.3, 0.2, 0.1 }
 
     -- Moves the whole body by `transform` for the server only (restored
     -- before render, so the client never sees it).
@@ -4992,13 +5425,15 @@ do
         if typeof(cf) == "CFrame" then overrideRoot = cf else overrideRoot = nil end
     end
 
-    -- Heartbeat: runs after physics, right before replication is sent.
+    -- Runs right after physics (PostSimulation) and again after Heartbeat.
+    -- The path phase only advances on the first call of the frame so the
+    -- movement speed still matches the slider.
     local applyServerPoseInner
-    local function applyServerPose(dt)
-        applyServerPoseInner(dt)
+    local function applyServerPose(dt, advance)
+        applyServerPoseInner(dt, advance)
         if displaced then lastDisplacedAt = now() else lastRealAt = now() end
     end
-    function applyServerPoseInner(dt)
+    function applyServerPoseInner(dt, advance)
         restorePose()
         clearServerPose()
         if overrideRoot then
@@ -5026,16 +5461,65 @@ do
             return
         end
 
-        phase = (phase + math.min(dt, 0.1) * settings.Speed) % 2
-        local offset = calculateOffset(phase)
-        if settings.SafeFooting and not settings.Underground and offset.Magnitude > 0.001 then
-            local scale = 1
-            for _ = 1, 4 do
-                if SpaceFree(root.Position + offset * scale) then break end
-                scale = scale * 0.5
-            end
-            offset = (scale < 0.25) and Vector3.zero or offset * scale
+        -- Shot-pose freeze: hold the exact pose an in-flight shot was built
+        -- from until the shot has had time to reach the server and be
+        -- validated. The peek / override paths above still win.
+        if t < freezeUntil and frozenRootCF then
+            local transform = frozenRootCF * root.CFrame:Inverse()
+            applyTransform(character, root, transform,
+                frozenRootCF.Position - root.Position, frozenRootCF.Position)
+            return
         end
+
+        if advance then
+            phase = (phase + math.min(dt, 0.1) * settings.Speed) % 2
+        end
+        local offset = calculateOffset(phase)
+        -- Safe footing is skipped for anti-esp: the spoof pose is DELIBERATELY
+        -- far away and inside the floor, so wall checks would only zero it
+        -- out (the exact bug that used to kill square / prism indoors).
+        if settings.SafeFooting and not settings.Underground and not settings.AntiESP
+            and offset.Magnitude > 0.001 then
+            -- The old check shrank this single offset towards zero, so next
+            -- to any wall (most of this map) the desync sat at 0 for nearly
+            -- every frame and square / prism looked dead. The jitter is only
+            -- dropped now when nothing free can be found at all.
+            if not SpaceFree(root.Position + offset) then
+                local picked = nil
+                -- Nearby points on the same square / prism outline.
+                for _, shift in ipairs(SAFE_PATH_SHIFTS) do
+                    local alt = calculateOffset((phase + shift) % 2)
+                    if alt.Magnitude > 0.001 and SpaceFree(root.Position + alt) then
+                        picked = alt
+                        break
+                    end
+                end
+                -- Shorter steps along the same direction.
+                if not picked then
+                    for _, scale in ipairs(SAFE_PATH_SCALES) do
+                        if SpaceFree(root.Position + offset * scale) then
+                            picked = offset * scale
+                            break
+                        end
+                    end
+                end
+                offset = picked or Vector3.zero
+            end
+        end
+        -- Blocked-spot hops used to teleport the pose between safe-footing
+        -- candidates, which read as crazy jitter on the server pose (what
+        -- other players and the ghost see). The offset is now rate limited:
+        -- normal path motion passes through untouched, while a teleport-scale
+        -- jump is swept over a few frames at up to twice the normal speed.
+        if smoothedOffset and math.max(dt, 0) > 0 then
+            local expectedStep = math.max(dt, 0) * settings.Speed * settings.Range * 8
+            local maxDelta = expectedStep * 2 + 0.5
+            local delta = offset - smoothedOffset
+            if delta.Magnitude > maxDelta then
+                offset = smoothedOffset + delta.Unit * maxDelta
+            end
+        end
+        smoothedOffset = offset
         if offset.Magnitude < 0.001 then return end
         local pivot = root.Position
         local destination = pivot + offset
@@ -5057,7 +5541,14 @@ do
         applyTransform(character, root, transform, offset, destination)
     end
 
-    add(RunService.Heartbeat:Connect(applyServerPose))
+    -- The displaced pose is asserted twice: right after the physics step
+    -- (PostSimulation) and again after Heartbeat. The engine's character
+    -- update flush point has moved around between versions, so both
+    -- post-physics windows are covered; physics itself always simulates the
+    -- real pose via the restores below (before the camera AND before the
+    -- next step).
+    add(RunService.PostSimulation:Connect(function(dt) applyServerPose(dt, true) end))
+    add(RunService.Heartbeat:Connect(function(dt) applyServerPose(dt, false) end))
     -- Before the camera and render: real body back, so the client sees and
     -- the camera follows the real pose.
     RunService:BindToRenderStep(renderKey, Enum.RenderPriority.First.Value, restorePose)
@@ -5066,6 +5557,7 @@ do
     add(LocalPlayer.CharacterRemoving:Connect(function()
         restorePose()
         clearServerPose()
+        freezeUntil, frozenRootCF = 0, nil
     end))
 
     section:Toggle({
@@ -5087,6 +5579,15 @@ do
     section:Toggle({ Name = "ug shot peek (fewer invalids)", Flag = "advanced_aa_shotpeek",
         Default = true,
         Callback = function(value) settings.ShotPeek = value; if not value then peekUntil = 0 end end })
+    section:Toggle({ Name = "anti esp (character spoof)", Flag = "advanced_aa_antiesp",
+        Default = false,
+        Callback = function(value) settings.AntiESP = value end })
+    section:Slider({ Name = "anti esp distance (studs)", Flag = "advanced_aa_antiesp_dist",
+        Min = 10, Max = 300, Default = 60, Decimals = 5,
+        Callback = function(value) settings.AntiESPDistance = value end })
+    section:Slider({ Name = "anti esp reroll (s)", Flag = "advanced_aa_antiesp_reroll",
+        Min = 0.5, Max = 10, Default = 3, Decimals = 0.5,
+        Callback = function(value) settings.AntiESPReroll = value end })
     local function failsafeSet(enabled, attempts, syncTime)
         local target = (type(getgenv) == "function" and getgenv()) or _G
         if type(target.AdvancedAASetFailsafe) == "function" then
@@ -5104,14 +5605,23 @@ do
     section:Toggle({ Name = "safe footing (square / prism)", Flag = "advanced_aa_safefooting",
         Default = true,
         Callback = function(value) settings.SafeFooting = value end })
+    section:Toggle({ Name = "smooth shots (orbit never pauses)", Flag = "advanced_aa_smoothshots",
+        Default = true,
+        Callback = function(value)
+            settings.SmoothShots = value
+            if value then
+                -- Kill any freeze left over from stable mode right away.
+                freezeUntil, frozenRootCF = 0, nil
+            end
+        end })
     section:Slider({
         Name = "aa range (studs)", Flag = "advanced_aa_range",
         Min = 0, Max = 30, Default = 4, Decimals = 1,
         Callback = function(value) settings.Range = value end,
     })
     section:Slider({
-        Name = "prism height (studs)", Flag = "advanced_aa_height",
-        Min = 0, Max = 30, Default = 4, Decimals = 1,
+        Name = "aa height (studs, Y)", Flag = "advanced_aa_height",
+        Min = 0, Max = 30, Default = 0, Decimals = 1,
         Callback = function(value) settings.Height = value end,
     })
     section:Slider({
@@ -5129,6 +5639,7 @@ do
         settings.Enabled = false
         restorePose()
         clearServerPose()
+        freezeUntil, frozenRootCF = 0, nil
         pcall(function() RunService:UnbindFromRenderStep(renderKey) end)
         for _, connection in ipairs(connections) do
             pcall(function() connection:Disconnect() end)
