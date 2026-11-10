@@ -483,6 +483,18 @@ local function AAStatus()
     return false, 0
 end
 
+-- True when the active AA is a moving square / prism (not UG, not anti-ESP).
+-- Orbit shots are built from the live pose, so one occluded frame must not
+-- park the orbit with a peek - fire is held briefly instead.
+local function AAIsOrbit()
+    local env = (type(getgenv) == "function" and getgenv()) or _G
+    if type(env.AdvancedAAIsOrbit) == "function" then
+        local ok, value = pcall(env.AdvancedAAIsOrbit)
+        if ok then return value == true end
+    end
+    return false
+end
+
 -- Drop AA entirely for a few seconds. This is the failsafe path and the ONLY
 -- thing that interrupts UG mid-fight: no offset at all means every shot comes
 -- from the real pose. There is no per-shot sync any more.
@@ -662,6 +674,11 @@ end
 local WallPen = {
     Enabled = false,
     ShowMarker = true,
+    -- Smart UG: this game lets a bullet skim UNDER the map surface when the
+    -- line is angled (terrain wallbang), so terrain must never be treated as
+    -- infinite cover. When enabled, a terrain hit is reported as a passable
+    -- "terrain" line that the aim may use when nothing cleaner exists.
+    TerrainPass = true,
     -- Derived from the single budget slider below (percent of the full budget).
     Budget = 25,
     MaxThickness = 5,
@@ -675,6 +692,9 @@ local WallPen = {
 }
 
 local WALLPEN_MIN_SPAN = 0.02
+-- Terrain only leaks bullets when the line is angled: |unit.Y| above this is
+-- near vertical (straight down into the ground) and stays blocked.
+local WALLPEN_TERRAIN_MAX_SLOPE = 0.9
 -- Full budget. The old ceiling (5 studs / 6 layers) was below a floor between
 -- storeys, so shooting someone on the level below was always "Blocked" and the
 -- raw aim just hit the floor. 20 studs also covers a baseplate-thick slab at
@@ -787,6 +807,22 @@ function WallPen.Trace(origin, point, model)
         end
 
         local part = hit.Instance
+        -- Smart UG / terrain wallbang: this game's bullets skim under the map
+        -- surface when the line is angled, so terrain is NOT cover. It is
+        -- reported as its own "terrain" state and the aim decides whether to
+        -- spend the shot on it (EvaluateShot). Steep, near-vertical lines
+        -- still count as blocked, and the aim failsafe's backoff quiets
+        -- terrain shots exactly like any other wallpen attempt.
+        if part:IsA("Terrain") then
+            if not WallPen.TerrainPass
+                or math.abs(unit.Y) > WALLPEN_TERRAIN_MAX_SLOPE
+                or os.clock() < (WallPen.BackoffUntil or 0) then
+                return { state = "blocked", thickness = math.huge, layers = layers + 1,
+                    part = part, entry = hit.Position, exit = hit.Position, terrain = true }
+            end
+            return { state = "terrain", thickness = 0, layers = 0,
+                part = part, entry = hit.Position, exit = hit.Position }
+        end
         if IsCover(part) then
             layers += 1
             local span = ExitDistance(part, hit.Position, unit)
@@ -1154,6 +1190,7 @@ do -- combat
     local InstantReload = false;
     local ForceFullAuto = false;
     local NoSpread = false;
+    local AutoWeaponSwitch = false;
     local RagebotTarget = nil 
     local SilentAimTarget = nil 
 
@@ -1567,6 +1604,27 @@ do -- combat
             end
             considerWall(target, target.Position, direct)
 
+            -- Smart UG fallback: an angled line whose only obstruction is
+            -- terrain (the bullet skims under the map surface). Clear lines,
+            -- hitscan and measured wallpen plans always win - this is only
+            -- spent when nothing better exists. The shallowest line wins,
+            -- because a flatter angle is what lets the bullet travel under the
+            -- ground instead of driving straight down into it.
+            local bestTerrain
+            local function considerTerrain(part, point, origin)
+                if not WallPen.TerrainPass then return end
+                if typeof(origin) ~= "Vector3" then return end
+                local delta = point - origin
+                if delta.Magnitude < 0.1 then return end
+                local slope = math.abs(delta.Unit.Y)
+                if not bestTerrain or slope < bestTerrain.slope then
+                    bestTerrain = {part = part, point = point, slope = slope}
+                end
+            end
+            if direct.state == "terrain" then
+                considerTerrain(direct.reached or target, target.Position, origin)
+            end
+
             -- 2. Expanded hull: cheapest way to turn a graze into a hit.
             if HitboxExpander.Enabled and plr then
                 local hbePoint, hbePart = HitboxExpander.Probe(plr, origin)
@@ -1578,7 +1636,11 @@ do -- combat
             -- 3. Sample the rest of the rig: clear samples win, blocked ones feed
             --    the wallpen decision.
             local parts = { target }
+            -- Smart UG only needs the rest of the rig when the head line already
+            -- skims terrain: a lower part gives a shallower under-map angle, and
+            -- a wall (not terrain) blocking the head is never bypassed this way.
             local scanBody = HitScanEnabled or HitboxExpander.Enabled or WallPen.Enabled
+                or (WallPen.TerrainPass and direct.state == "terrain")
             if scanBody then
                 for _, name in ipairs(RIG_PART_NAMES) do
                     local part = model:FindFirstChild(name)
@@ -1614,6 +1676,8 @@ do -- combat
                         HitScanEnabled and "Hitscan: clear" or "Body: clear")
                 elseif trace.state == "blocked" then
                     considerWall(part, point, trace)
+                elseif trace.state == "terrain" then
+                    considerTerrain(part, point, origin)
                 end
             end
 
@@ -1653,6 +1717,14 @@ do -- combat
                         1.5 + trace.thickness * 0.1 + math.max(trace.layers - 1, 0) * 0.05, label)
                 end
                 report(label)
+            end
+
+            -- Smart UG / terrain wallbang: no clear line and no measurable
+            -- wallpen was better, so spend the shot on the angled under-map
+            -- line - the bullet skims the terrain and still registers.
+            if bestTerrain then
+                return plan(bestTerrain.part, bestTerrain.point, 1.8,
+                    "Smart UG: under map")
             end
 
             -- 5. Origin manipulation is the last resort: it always carries risk.
@@ -1825,7 +1897,8 @@ do -- combat
         -- never comes the shot is dropped instead of fired as an invalid.
         local function QueueSilentShot(Args, Target)
             task.spawn(function()
-                local deadline = os.clock() + 1.0
+                local queueStart = os.clock()
+                local deadline = queueStart + 1.0
                 while os.clock() < deadline do
                     local state = AAShotState()
                     if state ~= "transition" then
@@ -1867,8 +1940,13 @@ do -- combat
                             -- peek. AAPeek returns false while peeking is off
                             -- or cooling down - the loop just keeps waiting,
                             -- because firing now would be a guaranteed
-                            -- invalid.
-                            AAPeek(AASyncWindow() * 2 + 0.15)
+                            -- invalid. Square / prism gets a short grace
+                            -- window first so a single occluded frame does
+                            -- not park the orbit; if the orbit brings a line
+                            -- it fires without ever peeking.
+                            if not AAIsOrbit() or os.clock() - queueStart >= 0.15 then
+                                AAPeek(AASyncWindow() * 2 + 0.15)
+                            end
                         else
                             -- Real pose cannot see the target either: drop.
                             return
@@ -2037,7 +2115,8 @@ do -- combat
                         -- pose is a guaranteed invalid, and the miss streak
                         -- would trip the failsafe and drop UG for nothing.
                         local realHead = AARealPartPosition(LocalHead)
-                        if GetVisibleTarget(Gun, realHead) then
+                        if GetVisibleTarget(Gun, realHead)
+                            and (not AAIsOrbit() or os.clock() - LastShot > 0.15) then
                             AAPeek(AASyncWindow() * 2 + 0.15)
                         end
                         continue
@@ -2121,10 +2200,22 @@ do -- combat
         peekOverlap.FilterType = Enum.RaycastFilterType.Exclude
         peekOverlap.MaxParts = 6
 
+        -- Reused filter table. The old version cloned a fresh list for every
+        -- ray and every overlap probe (hundreds of allocations per spot
+        -- search). AAIgnoreList() is already cached, so this only rebuilds
+        -- when the target or the cached base actually changes.
+        local peekIgnoreList, peekIgnoreModel, peekIgnoreBase, peekIgnoreAt = {}, nil, nil, 0
         local function PeekIgnore(targetModel)
-            local list = table.clone(AAIgnoreList())
-            if targetModel then table.insert(list, targetModel) end
-            return list
+            local base = AAIgnoreList()
+            local now = os.clock()
+            if targetModel ~= peekIgnoreModel or base ~= peekIgnoreBase
+                or base[1] ~= peekIgnoreList[1] or now - peekIgnoreAt > 0.5 then
+                table.clear(peekIgnoreList)
+                for i = 1, #base do peekIgnoreList[i] = base[i] end
+                if targetModel then peekIgnoreList[#peekIgnoreList + 1] = targetModel end
+                peekIgnoreModel, peekIgnoreBase, peekIgnoreAt = targetModel, base, now
+            end
+            return peekIgnoreList
         end
 
         -- Underground = solid geometry right above the head and nothing to
@@ -2137,6 +2228,19 @@ do -- combat
             if not up then return false end
             local down = workspace:Raycast(head.Position, Vector3.new(0, -12, 0), peekParams)
             return down == nil
+        end
+
+        -- The picker re-checked every candidate's underground state on every
+        -- 0.1s scan (two rays each). A short cache keeps that out of the hot
+        -- path without making the result stale enough to matter.
+        local undergroundCache = setmetatable({}, { __mode = "k" })
+        local function IsUndergroundCached(model)
+            local now = os.clock()
+            local entry = undergroundCache[model]
+            if entry and now - entry.time < 0.4 then return entry.value end
+            local value = IsUnderground(model)
+            undergroundCache[model] = { value = value, time = now }
+            return value
         end
 
         local function SpotFree(position, targetModel)
@@ -2203,26 +2307,41 @@ do -- combat
         local function FindPeekSpot(targetPart, model)
             local targetPos = targetPart.Position
             local minY = workspace.FallenPartsDestroyHeight + 25
-            local underground = IsUnderground(model)
+            local underground = IsUndergroundCached(model)
+            local ignore = PeekIgnore(model)
+            peekParams.FilterDescendantsInstances = ignore
+            peekOverlap.FilterDescendantsInstances = ignore
+
+            -- Every candidate costs several rays / overlap queries. The search
+            -- is split across frames and hard-capped so the client keeps
+            -- rendering while it looks for a spot instead of stalling for one
+            -- long frame.
+            local probes = 0
+            local function nextProbe()
+                probes += 1
+                if probes % 10 == 0 then task.wait() end
+                return probes > 80
+            end
 
             -- 1) Below them: progressively deeper until under the slab.
-            for _, d in ipairs({ 4, 6, 8, 11, 14 }) do
+            for _, d in ipairs({ 4, 8, 12 }) do
                 local spot = targetPos - Vector3.new(0, d, 0)
                 if spot.Y > minY and SpotFree(spot, model)
                     and (underground or SpotSafe(spot, model))
                     and SpotViable(targetPart, spot) then
                     return spot
                 end
+                if nextProbe() then return nil end
             end
 
             -- 2) Sides: ring around them, biased to below their head height
             --    (floor level is where cover lives). Only spots their head
             --    cannot see straight into.
             local golden = math.pi * (3 - math.sqrt(5))
-            local count = 24
+            local count = 12
             local viableTries = 0
             local safeCheck = underground and SpotSafeUnderground or SpotSafe
-            for _, radius in ipairs({ 4, 7, 10, 14 }) do
+            for _, radius in ipairs({ 4, 8, 12 }) do
                 for i = 1, count do
                     local y = -0.4 - 1.2 * ((i - 0.5) / count)
                     local radial = math.sqrt(math.max(0, 1 - y * y))
@@ -2236,12 +2355,13 @@ do -- combat
                         if SpotViable(targetPart, spot) then
                             return spot
                         end
-                        -- Bound the cost: cover this thick / this many
-                        -- candidates is enough for any real position.
-                        if viableTries >= 16 then break end
+                        -- Bound the cost: this many viable candidates is
+                        -- enough to find cover for any real position.
+                        if viableTries >= 8 then break end
                     end
+                    if nextProbe() then return nil end
                 end
-                if viableTries >= 16 then break end
+                if viableTries >= 8 then break end
             end
 
             -- 3) Open peek (opt-in last resort): the old clear-line search.
@@ -2262,6 +2382,7 @@ do -- combat
                                 return spot
                             end
                         end
+                        if nextProbe() then return nil end
                     end
                 end
             end
@@ -2300,7 +2421,11 @@ do -- combat
 
             local spot = FindPeekSpot(target, model)
             if not spot then
-                PeekResolver.LastRun = os.clock() - PeekResolver.Cooldown * 0.5
+                -- A failed search already costs the most rays in the whole
+                -- feature. Retrying it half a cooldown later just re-ran the
+                -- same expensive search every few hundred ms, so a miss now
+                -- waits the full cooldown like a completed peek does.
+                PeekResolver.LastRun = os.clock()
                 return
             end
 
@@ -2372,6 +2497,13 @@ do -- combat
         end
 
         -- Target picker: closest enemy that the normal aim cannot hit.
+        -- EvaluateShot is the expensive part of the resolver (rays + wallpen
+        -- plan), and the picker used to run it twice for every candidate every
+        -- 0.1s. Each target is now re-evaluated at most every 0.35s, and only
+        -- the two best candidates are considered per scan, so an idle resolver
+        -- with several players in range costs a fraction of what it did.
+        local peekCheckedAt = setmetatable({}, { __mode = "k" })
+        local PEEK_CHECK_INTERVAL = 0.35
         task.spawn(function()
             while true do
                 task.wait(0.1)
@@ -2400,11 +2532,15 @@ do -- combat
                         local fovHum = fovModel and fovModel:FindFirstChildOfClass("Humanoid")
                         if fovHum and fovHum.Health > 0 then
                             local dist = (fovTarget.Position - myHead.Position).Magnitude
+                            local now = os.clock()
                             if dist <= PeekResolver.Range
-                                and (not PeekResolver.OnlyUnderground or IsUnderground(fovModel))
-                                and not EvaluateShot(fovTarget, realHead)
-                                and not EvaluateShot(fovTarget, serverHead) then
-                                RunPeek(fovTarget)
+                                and now - (peekCheckedAt[fovTarget] or 0) >= PEEK_CHECK_INTERVAL
+                                and (not PeekResolver.OnlyUnderground or IsUndergroundCached(fovModel)) then
+                                peekCheckedAt[fovTarget] = now
+                                if not EvaluateShot(fovTarget, realHead)
+                                    and not EvaluateShot(fovTarget, serverHead) then
+                                    RunPeek(fovTarget)
+                                end
                             end
                         end
                         continue
@@ -2431,9 +2567,12 @@ do -- combat
                     return a.dist < b.dist
                 end)
 
-                for i = 1, math.min(#candidates, 4) do
+                for i = 1, math.min(#candidates, 2) do
                     local c = candidates[i]
-                    local underground = IsUnderground(c.model)
+                    local now = os.clock()
+                    if now - (peekCheckedAt[c.head] or 0) < PEEK_CHECK_INTERVAL then continue end
+                    peekCheckedAt[c.head] = now
+                    local underground = IsUndergroundCached(c.model)
                     if (not PeekResolver.OnlyUnderground or underground)
                         and not EvaluateShot(c.head, realHead)
                         and not EvaluateShot(c.head, serverHead) then
@@ -2521,6 +2660,69 @@ do -- combat
             end
 
             return oldWait(time, ...)
+        end)
+
+        -- The police taser reports ToolType == "Gun" in some Prison Life builds
+        -- even though it is a utility. It must never be cycled to (or treated
+        -- as the gun that starts a cycle), so name matching is the reliable
+        -- filter here.
+        local function SwitchableGun(tool)
+            if not tool or not tool:IsA("Tool") then return false end
+            if tool:GetAttribute("ToolType") ~= "Gun" then return false end
+            local name = string.lower(tool.Name)
+            return not (string.find(name, "taser", 1, true)
+                or string.find(name, "taze", 1, true))
+        end
+
+        -- Auto weapon switcher: cycles through the guns you carry so every gun
+        -- gets refreshed instead of one gun being re-equipped forever. The
+        -- 0.2s cadence is deliberately fixed (no slider): it is fast enough to
+        -- refresh a shotgun between pumps and slow enough that the equip noise
+        -- does not turn into a strobe. Only ToolType == "Gun" tools are
+        -- touched, the taser is skipped, it only acts while a gun is already
+        -- equipped, and it needs at least two guns in the rig, so keys, melee
+        -- and the taser stay where they are.
+        task.spawn(function()
+            local lastSwitch = 0
+            while true do
+                task.wait(0.05)
+                if not AutoWeaponSwitch then continue end
+                local now = os.clock()
+                if now - lastSwitch < 0.2 then continue end
+                local char = LocalPlayer.Character
+                local hum = char and char:FindFirstChildOfClass("Humanoid")
+                local equipped = char and char:FindFirstChildOfClass("Tool")
+                if not (hum and equipped and SwitchableGun(equipped)) then
+                    continue
+                end
+                local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+                local names = {}
+                for _, container in ipairs({ char, backpack }) do
+                    if container then
+                        for _, tool in ipairs(container:GetChildren()) do
+                            if SwitchableGun(tool) then
+                                table.insert(names, tool.Name)
+                            end
+                        end
+                    end
+                end
+                if #names < 2 then continue end
+                table.sort(names)
+                local index = 1
+                for i, name in ipairs(names) do
+                    if name == equipped.Name then
+                        index = i
+                        break
+                    end
+                end
+                local nextName = names[(index % #names) + 1]
+                local nextTool = char:FindFirstChild(nextName)
+                    or (backpack and backpack:FindFirstChild(nextName))
+                if nextTool and nextTool ~= equipped then
+                    hum:EquipTool(nextTool)
+                    lastSwitch = now
+                end
+            end
         end)
 
     --#endregion
@@ -2630,6 +2832,19 @@ do -- combat
         Sections.aimbot:Toggle({
             Name = "wallpen hit marker"; Flag = "wallpen_marker"; Default = true;
             Callback = function(v) WallPen.ShowMarker = v end;
+        })
+        -- Smart UG / terrain wallbang: this game's bullets skim UNDER the map
+        -- surface on angled lines, so terrain is not real cover. With this on,
+        -- the aim will spend a shot on an angled under-map line when no clear
+        -- line, hitscan or measurable wallpen plan exists. Steep (near
+        -- vertical) terrain lines stay blocked, and the failsafe backoff still
+        -- quiets repeated terrain attempts.
+        Sections.aimbot:Toggle({
+            Name = "smart UG (terrain wallbang)"; Flag = "smartug"; Default = true;
+            Callback = function(v)
+                WallPen.TerrainPass = v;
+                table.clear(WallPen.Cache);
+            end
         })
         Sections.aimbot:Slider({
             Name = "hostile inmate threat range"; Flag = "aggrorange";
@@ -2743,6 +2958,17 @@ do -- combat
             Callback = function(v)
                 NoSpread = v;
             end 
+        })
+
+        -- Fixed 0.2s cycle through the guns you carry so each one refreshes.
+        -- No interval slider on purpose.
+        Sections.gunmods:Toggle({
+            Name = 'auto weapon switcher (0.2s)';
+            Flag = 'autoweaponswitch';
+            Default = false;
+            Callback = function(v)
+                AutoWeaponSwitch = v;
+            end
         })
 
 
@@ -4993,10 +5219,28 @@ end
 --   * Square walks the server position around a square loop in the XZ
 --     plane (range = size, speed = how fast it orbits), clockwise.
 --   * Prism walks it around a clockwise triangular loop in the XZ plane.
---   * The paths NEVER move Y. The height slider is the only vertical
---     offset (a constant lift above the real position). Safe footing
---     searches nearby outline points / shorter steps only - no vertical
---     hop any more.
+--   * Omniscient jumps the server position to a random point on a sphere in
+--     X/Y/Z (radius capped by the same range slider), re-rolled on its own
+--     timer. Because it already moves above AND below ground, enabling it
+--     cancels underground and ug horizontal - those would only fight it for
+--     the Y axis. Everything else stacks with it.
+--   * EVERY mode stacks: anti-ESP + square + prism + omniscient + height
+--     can all be enabled together. Square and prism are averaged and the
+--     combined path is clamped to the range slider, so having several on
+--     keeps the pose inside the requested radius instead of multiplying it;
+--     anti-ESP adds its far horizontal centre and the height slider adds
+--     its lift on top of that. Underground is mutually exclusive with
+--     omniscient.
+--   * The default speed is 1 cycle/s on purpose: character replication
+--     lands a snapshot on the server roughly every 50ms, and the shot is
+--     validated against the pose it holds when the remote arrives. A fast
+--     orbit moves several studs between snapshots, so the origin the aim
+--     fired from no longer matches the server pose -> invalid shots -> the
+--     failsafe drops the AA. The slider still goes up to 20 for
+--     experimentation, but shots get unreliable well before that.
+--   * The shape paths NEVER move Y. The height slider lifts and the UG depth
+--     slider drops; when modes are stacked both apply. Safe footing searches
+--     nearby outline points / shorter steps only - no vertical hop any more.
 --   * Shots fired while the pose orbits are built from the pose the server
 --     holds at fire time; pose replication and the gun remote share the
 --     same one-way latency, so that is still the pose the server holds
@@ -5061,10 +5305,23 @@ do
         AntiESP = false,
         AntiESPDistance = 60,
         AntiESPReroll = 3,
+        -- Omniscient: random sphere around the real root, in X/Y/Z. Radius is
+        -- capped by the range slider, and the point is re-rolled on its own
+        -- timer. Cancels UG (it already goes above and below ground).
+        Omniscient = false,
+        OmniscientReroll = 0.75,
         Range = 4,
         Height = 0,
         UndergroundDepth = 20,
-        Speed = 4,
+        -- Cycles per second. Kept slow on purpose: the server validates a
+        -- shot against the pose snapshot it holds when the remote arrives, and
+        -- character replication only lands a snapshot every ~50ms. A fast
+        -- orbit (the old default of 4 = ~128 studs/s) moves several studs
+        -- between snapshots, so the shot origin no longer matches the pose the
+        -- server checks -> invalid shots -> the failsafe drops the AA. At 1
+        -- cycle/s the mismatch is under a stud, while the shape still reads
+        -- clearly on the ghost.
+        Speed = 1,
     }
 
     -- Real pose saved at Heartbeat, written back before render / physics.
@@ -5195,11 +5452,16 @@ do
     end
     env.AdvancedAAPeek = function(seconds)
         if not settings.ShotPeek or not settings.Enabled then return false end
+        -- Square / prism must keep orbiting to stay useful, so a peek there
+        -- only holds the real pose for one shot window (~latency + a frame)
+        -- instead of the long UG cap. UG / anti-ESP poses are deliberately
+        -- unshootable, so those keep the full cap.
+        local cap = (settings.Underground or settings.AntiESP) and PEEK_MAX or 0.3
         local t = now()
         if t < peekUntil then
             -- Already peeking: extend, but never past the cap.
-            if t - peekStart > PEEK_MAX then return false end
-            peekUntil = math.max(peekUntil, math.min(t + seconds, peekStart + PEEK_MAX + 0.2))
+            if t - peekStart > cap then return false end
+            peekUntil = math.max(peekUntil, math.min(t + seconds, peekStart + cap + 0.05))
             return true
         end
         if peekUntil > 0 and t - peekUntil < PEEK_COOLDOWN then return false end
@@ -5216,7 +5478,7 @@ do
     -- from (absolute, so walking does not slide it) until the shot has been
     -- validated. UG never needs it: its pose is static already.
     env.AdvancedAAFreeze = function(seconds)
-        if not settings.Enabled or settings.Underground or settings.SmoothShots then
+        if not settings.Enabled or settings.SmoothShots then
             return false
         end
         local character = LocalPlayer.Character
@@ -5239,6 +5501,15 @@ do
     env.AdvancedAAForceSync = forceSync
     env.AdvancedAAStatus = function()
         return settings.Enabled == true, serverOffset.Magnitude, now() < forceSyncUntil
+    end
+    -- Used by the aim: a moving square / prism keeps orbiting through a shot,
+    -- so the aim must not park it on the first occluded frame (UG / anti-ESP
+    -- poses are deliberately unshootable and still peek immediately).
+    env.AdvancedAAIsOrbit = function()
+        return settings.Enabled == true
+            and (settings.Square or settings.Prism or settings.Omniscient)
+            and not settings.Underground
+            and not settings.AntiESP
     end
     env.AdvancedAADesync = function()
         if now() < forceSyncUntil then return 0 end
@@ -5333,6 +5604,33 @@ do
         return antiESPDir
     end
 
+    -- Omniscient position: a random point on a sphere around the real root.
+    -- Unlike square / prism this uses Y as well, so the server pose can sit
+    -- above or below ground in any direction. A uniform point on the unit
+    -- sphere is z uniform in [-1, 1] plus a uniform azimuth; the radius is
+    -- sampled inside the range slider so the pose never leaves the allowed
+    -- sphere. The point is held for OmniscientReroll seconds (the normal
+    -- offset smoothing sweeps each jump over a few frames) instead of
+    -- changing every frame, which would outrun the server snapshot and make
+    -- every shot invalid.
+    local omniDir = Vector3.new(0, 1, 0)
+    local omniScale = 1
+    local omniRerollAt = 0
+    local function OmniscientOffset()
+        if now() > omniRerollAt then
+            local z = math.random() * 2 - 1
+            local azimuth = math.random() * math.pi * 2
+            local radial = math.sqrt(math.max(0, 1 - z * z))
+            omniDir = Vector3.new(math.cos(azimuth) * radial, z,
+                math.sin(azimuth) * radial)
+            -- Anywhere inside the sphere, kept slightly off dead centre so
+            -- the mode always desyncs the pose.
+            omniScale = 0.35 + math.random() * 0.65
+            omniRerollAt = now() + math.max(settings.OmniscientReroll, 0.1)
+        end
+        return omniDir * (math.max(settings.Range, 0) * omniScale)
+    end
+
     local function calculateOffset(t)
         -- Anti-ESP character spoof: everything other clients see (ESP box,
         -- chams, their aimbot's target position) follows the pose the server
@@ -5346,26 +5644,44 @@ do
                 spoof += Vector3.new(0, -math.clamp(settings.UndergroundDepth, 1, 30), 0)
             end
         end
-        -- UG is a pure vertical move: X and Z are always 0, the depth slider
-        -- is the only thing that changes it. (With anti-esp on it stacks the
-        -- horizontal spoof on top of the drop.)
-        if settings.Underground then
-            return spoof + Vector3.new(0, -math.clamp(settings.UndergroundDepth, 1, 30), 0)
+        -- Every AA mode now STACKS instead of one overriding the others:
+        -- anti-ESP is the far horizontal centre, square and prism both add
+        -- their horizontal paths, omniscient adds a random sphere point, the
+        -- height slider lifts and UG drops. The two XZ shapes are averaged,
+        -- so turning both on keeps the combined orbit inside the range
+        -- slider instead of doubling it - the pose gets harder to predict
+        -- without moving the shot origin further away. None of this changes
+        -- the aim path itself: every shot is still built and validated from
+        -- the exact pose the server holds.
+        local shape, shapes = Vector3.zero, 0
+        if settings.Square then
+            shape += square(t)
+            shapes += 1
         end
-        -- Square / prism are HORIZONTAL shapes: they only move X and Z, so
-        -- the server position orbits around the real position at the same
-        -- height. Y is owned by the height slider alone (a constant lift),
-        -- never by the path itself. With anti-esp on, the shape orbits
-        -- around the spoofed centre instead of the real position.
-        local shape
         if settings.Prism then
-            shape = triangle(t)
-        elseif settings.Square then
-            shape = square(t)
-        else
-            return spoof
+            shape += triangle(t)
+            shapes += 1
         end
-        return spoof + shape * settings.Range + Vector3.new(0, math.max(settings.Height, 0), 0)
+        if shapes > 0 then
+            shape = shape * (math.max(settings.Range, 0) / shapes)
+        end
+        -- Omniscient is a random point on the same sphere, so it stacks with
+        -- the XZ shapes instead of replacing them. The combined vector is
+        -- clamped back onto the sphere surface: the pose never travels more
+        -- than the range slider, no matter how many modes are enabled.
+        if settings.Omniscient then
+            shape += OmniscientOffset()
+            local length = shape.Magnitude
+            local range = math.max(settings.Range, 0)
+            if length > range and length > 0.001 then
+                shape = shape * (range / length)
+            end
+        end
+        local lift = math.max(settings.Height or 0, 0)
+        if settings.Underground and not settings.Omniscient then
+            lift -= math.clamp(settings.UndergroundDepth, 1, 30)
+        end
+        return spoof + shape + Vector3.new(0, lift, 0)
     end
 
     -- Safe footing for square / prism: the server pose must not end up
@@ -5478,8 +5794,10 @@ do
         -- Safe footing is skipped for anti-esp: the spoof pose is DELIBERATELY
         -- far away and inside the floor, so wall checks would only zero it
         -- out (the exact bug that used to kill square / prism indoors).
+        -- Omniscient is skipped for the same reason: it is allowed to go
+        -- below the floor and above the target.
         if settings.SafeFooting and not settings.Underground and not settings.AntiESP
-            and offset.Magnitude > 0.001 then
+            and not settings.Omniscient and offset.Magnitude > 0.001 then
             -- The old check shrank this single offset towards zero, so next
             -- to any wall (most of this map) the desync sat at 0 for nearly
             -- every frame and square / prism looked dead. The jitter is only
@@ -5560,6 +5878,11 @@ do
         freezeUntil, frozenRootCF = 0, nil
     end))
 
+    -- Kept so omniscient can switch the UG modes off programmatically: once
+    -- it is on, UG no longer has any job (omniscient already moves below and
+    -- above ground) and the two would only fight over the Y axis.
+    local undergroundToggle, ugHorizontalToggle, omniscientToggle
+
     section:Toggle({
         Name = "advanced aa", Flag = "advanced_aa_enabled", Default = false,
         Callback = function(value)
@@ -5571,14 +5894,38 @@ do
         Callback = function(value) settings.Square = value end })
     section:Toggle({ Name = "prism", Flag = "advanced_aa_prism", Default = false,
         Callback = function(value) settings.Prism = value end })
-    section:Toggle({ Name = "underground", Flag = "advanced_aa_underground", Default = false,
-        Callback = function(value) settings.Underground = value end })
-    section:Toggle({ Name = "ug horizontal (right side up)", Flag = "advanced_aa_ughorizontal",
+    undergroundToggle = section:Toggle({
+        Name = "underground", Flag = "advanced_aa_underground", Default = false,
+        Callback = function(value)
+            -- Omniscient covers above and below ground, so UG is redundant
+            -- while it is on; turning UG on hands the Y axis back to it.
+            if value and omniscientToggle and omniscientToggle.Value then
+                omniscientToggle:Set(false)
+            end
+            settings.Underground = value
+        end })
+    ugHorizontalToggle = section:Toggle({ Name = "ug horizontal (right side up)", Flag = "advanced_aa_ughorizontal",
         Default = true,
         Callback = function(value) settings.HorizontalUG = value end })
     section:Toggle({ Name = "ug shot peek (fewer invalids)", Flag = "advanced_aa_shotpeek",
         Default = true,
         Callback = function(value) settings.ShotPeek = value; if not value then peekUntil = 0 end end })
+    omniscientToggle = section:Toggle({
+        Name = "omniscient aa (random sphere)", Flag = "advanced_aa_omniscient",
+        Default = false,
+        Callback = function(value)
+            settings.Omniscient = value
+            if value then
+                -- Stacks with square / prism / anti esp on purpose, but UG
+                -- and its horizontal roll are cancelled: this mode already
+                -- travels above and below ground.
+                if undergroundToggle then undergroundToggle:Set(false) end
+                if ugHorizontalToggle then ugHorizontalToggle:Set(false) end
+            end
+        end })
+    section:Slider({ Name = "omniscient reroll (s)", Flag = "advanced_aa_omniscient_reroll",
+        Min = 0.1, Max = 5, Default = 0.75, Decimals = 0.05,
+        Callback = function(value) settings.OmniscientReroll = value end })
     section:Toggle({ Name = "anti esp (character spoof)", Flag = "advanced_aa_antiesp",
         Default = false,
         Callback = function(value) settings.AntiESP = value end })
@@ -5631,7 +5978,11 @@ do
     })
     section:Slider({
         Name = "aa speed (cycles/sec)", Flag = "advanced_aa_speed",
-        Min = 1, Max = 40, Default = 4, Decimals = 1,
+        -- High speeds still work as a desync, but the shot origin can no
+        -- longer match the server's replication snapshot, so shots start
+        -- going invalid and the failsafe drops the AA. 1 cycle/s is the
+        -- tested default; the cap is 20 for experimentation.
+        Min = 0.25, Max = 20, Default = 1, Decimals = 0.25,
         Callback = function(value) settings.Speed = value end,
     })
 
@@ -5662,6 +6013,7 @@ do
         env.AdvancedAASetOverride = nil
         overrideRoot = nil
         env.AdvancedAAPeek = nil
+        env.AdvancedAAIsOrbit = nil
         env.AdvancedAASyncWindow = nil
     end
 end
@@ -5760,5 +6112,6 @@ end
         end)
     end
     --#endregion
+
 
 Window:InitWindow()
