@@ -135,6 +135,94 @@
             ["hl crowbar"] = "rbxassetid://546410481";
         }
 
+        -- Hitmarkers: a short animated X plus an expanding ring, drawn where
+        -- the shot landed. Headshots and kills get their own colour. Purely
+        -- client-side Drawing objects, reused from a small pool so a fast
+        -- firing rate never allocates.
+        local Hitmarker = {
+            Enabled = false,
+            Color = Color3.fromRGB(255, 255, 255),
+            HeadColor = Color3.fromRGB(255, 90, 90),
+            KillColor = Color3.fromRGB(255, 40, 40),
+            Size = 16,
+            Duration = 0.45,
+        }
+        local SpawnHitmarker
+        do
+            local POOL_SIZE = 16
+            local pool, cursor = {}, 0
+
+            for _ = 1, POOL_SIZE do
+                local marker = { Lines = {}, Active = false, T = 0 }
+                for i = 1, 4 do
+                    local line = Drawing.new("Line")
+                    line.Visible = false
+                    line.Thickness = 2
+                    line.Transparency = 1
+                    marker.Lines[i] = line
+                end
+                local ring = Drawing.new("Circle")
+                ring.Visible = false
+                ring.Thickness = 1.5
+                ring.Radius = 1
+                marker.Ring = ring
+                pool[#pool + 1] = marker
+            end
+
+            function SpawnHitmarker(position, head, kill)
+                if not Hitmarker.Enabled or typeof(position) ~= "Vector2" then return end
+                cursor = cursor % POOL_SIZE + 1
+                local marker = pool[cursor]
+                marker.Active = true
+                marker.T = 0
+                marker.Position = position
+                marker.Head = head == true
+                marker.Kill = kill == true
+            end
+
+            RunService.RenderStepped:Connect(function(dt)
+                local step = math.clamp(dt or 0.016, 0, 0.1)
+                for _, marker in ipairs(pool) do
+                    if marker.Active then
+                        marker.T += step
+                        local progress = marker.T / math.max(Hitmarker.Duration, 0.05)
+                        if progress >= 1 then
+                            marker.Active = false
+                            for _, line in ipairs(marker.Lines) do line.Visible = false end
+                            marker.Ring.Visible = false
+                        else
+                            local color = marker.Kill and Hitmarker.KillColor
+                                or (marker.Head and Hitmarker.HeadColor or Hitmarker.Color)
+                            -- pop out then settle, fade to nothing, spin a touch
+                            local pop = 1 + 0.35 * math.sin(math.min(progress, 1) * math.pi)
+                            local scale = (0.75 + 0.6 * progress) * pop
+                            local alpha = 1 - progress
+                            local center = marker.Position
+                            local inner = Hitmarker.Size * 0.45 * scale
+                            local outer = Hitmarker.Size * scale
+                            for i = 1, 4 do
+                                local angle = progress * 0.35 + math.rad(45 + (i - 1) * 90)
+                                local dir = Vector2.new(math.cos(angle), math.sin(angle))
+                                local line = marker.Lines[i]
+                                line.From = center + dir * inner
+                                line.To = center + dir * outer
+                                line.Color = color
+                                line.Thickness = marker.Kill and 3 or 2
+                                line.Transparency = alpha
+                                line.Visible = true
+                            end
+                            local ring = marker.Ring
+                            ring.Position = center
+                            ring.Radius = outer * 1.15
+                            ring.Color = color
+                            ring.Transparency = alpha * 0.55
+                            ring.Visible = true
+                        end
+                    end
+                end
+            end)
+        end
+
         local function MarkShots(Shots)
             for _, v in Shots do
                 local Hit = type(v) == 'table' and v[3]
@@ -146,7 +234,14 @@
                 local Model = Hit:FindFirstAncestorOfClass("Model")
 
                 if Model then
-                    ShotAt[Model] = os.clock()
+                    -- Keep the impact point so the hitmarker can be drawn where
+                    -- the shot actually landed (not just under the crosshair).
+                    local point = type(v) == 'table' and v[2]
+                    ShotAt[Model] = {
+                        t = os.clock(),
+                        part = Hit,
+                        pos = typeof(point) == "Vector3" and point or Hit.Position,
+                    }
                 end
             end
         end
@@ -174,8 +269,23 @@
             Humanoid.HealthChanged:Connect(function(Health)
                 local Shot = ShotAt[Character]
 
-                if HitSoundEnabled and Health < LastHealth and Shot and os.clock() - Shot < 0.5 then
-                    PlayHitSound()
+                if Health < LastHealth and Shot and os.clock() - Shot.t < 0.5 then
+                    if HitSoundEnabled then
+                        PlayHitSound()
+                    end
+                    if Hitmarker.Enabled then
+                        local head = Shot.part and Shot.part.Name == "Head"
+                        local world = (head and Shot.part and Shot.part.Position) or Shot.pos
+                        local screen
+                        local camera = workspace.CurrentCamera
+                        if camera and typeof(world) == "Vector3" then
+                            local point, onScreen = camera:WorldToViewportPoint(world)
+                            if onScreen and point.Z > 0 then
+                                screen = Vector2.new(point.X, point.Y)
+                            end
+                        end
+                        SpawnHitmarker(screen or UserInputService:GetMouseLocation(), head, Health <= 0)
+                    end
                 end
 
                 LastHealth = Health
@@ -313,6 +423,20 @@ local AggroThreatRange = 80
 local WhitelistedPlayers = {}
 local BlacklistedPlayers = {}
 
+-- Team whitelists (the "team whitelist" dropdowns in the player filter).
+-- An empty selection means every team is allowed, exactly like the name
+-- whitelist above. The dropdown labels match the game's own team names and
+-- are mapped onto the roles TeamRole() returns below:
+--   inmate -> prisoner, police -> police, criminals -> criminal
+local AimTeamWhitelist = {}
+local ESPTeamWhitelist = {}
+local TEAM_WHITELIST_ITEMS = { "inmate", "police", "criminals" }
+local TEAM_WHITELIST_ROLES = {
+    inmate = "prisoner",
+    police = "police",
+    criminals = "criminal",
+}
+
 -- Targeting range, always 10 studs past the ESP draw distance: anything the
 -- aimbot locks on stays drawn by ESP. Reads the ESP library's live slider
 -- value through getgenv (it publishes itself there), the same bridge the
@@ -346,6 +470,13 @@ local function TeamRole(player)
     end
     if team then teamRoleCache[team] = role end
     return role
+end
+-- Team whitelist test. `set` is AimTeamWhitelist or ESPTeamWhitelist; empty
+-- means "no restriction". Unknown teams (role "unknown") are only allowed by
+-- an empty selection, so a whitelist can never accidentally leak them in.
+local function TeamWhitelistAllows(set, player)
+    if next(set) == nil then return true end
+    return set[TeamRole(player)] == true
 end
 local function TargetPriority(player)
     if not player or player == LocalPlayer then return nil end
@@ -415,6 +546,10 @@ end
 -- Combat-only priority; visual filtering remains independent.
 local function CombatPriority(plr)
     if not plr or plr == LocalPlayer then return nil end
+    -- Aim team whitelist: when teams are selected, nothing else may be aimed
+    -- at (this is checked before the blacklist so a blacklisted player on a
+    -- filtered-out team stays filtered out).
+    if not TeamWhitelistAllows(AimTeamWhitelist, plr) then return nil end
     local localRole, targetRole = TeamRole(LocalPlayer), TeamRole(plr)
     if localRole == "police" and targetRole == "prisoner" and not IsHostilePrisoner(plr)
         and not BlacklistedPlayers[plr.Name] then
@@ -505,6 +640,23 @@ local function AAForceSync(seconds)
     end
 end
 
+-- Shot outcome feedback to the advanced-aa auto UG depth. The watcher below
+-- reports each shot that was fired from a displaced pose: hits ease the depth
+-- back, misses deepen it.
+local function AAFeedback(hit)
+    local env = (type(getgenv) == "function" and getgenv()) or _G
+    if type(env.AdvancedAAFeedback) == "function" then
+        pcall(env.AdvancedAAFeedback, hit == true)
+    end
+end
+
+-- True while the auto UG depth feature is on, so the shot-outcome watcher
+-- keeps running even when the failsafe itself is switched off.
+local function AAAutoDepthOn()
+    local env = (type(getgenv) == "function" and getgenv()) or _G
+    return env.AdvancedAAAutoDepth == true
+end
+
 -- Which pose the SERVER currently holds for us, with network lag included:
 --   "server"     UG has been on long enough that the server has the underground
 --                pose -> shots must come from the underground head.
@@ -559,7 +711,8 @@ end
 -- The origin a shot has to be built from. While displaced the server holds the
 -- displaced pose, so shooting from the "real" head is what produces invalid
 -- shots - which is why UG used to look like it never hit anything.
-local function ShotOrigin(head)
+-- Kept for reference; the live shot paths now pick the pose inline.
+local function _ShotOrigin(head)
     if not head then return nil end
     if AADesync() > 0.25 then return AAServerPartPosition(head) end
     return AARealPartPosition(head)
@@ -630,20 +783,42 @@ function HitboxExpander.Probe(player, origin)
     local radius = math.max(HitboxExpander.Size, 0.05)
     local count = math.clamp(math.floor(HitboxExpander.Samples), 4, 64)
     local golden = math.pi * (3 - math.sqrt(5))
-    local bestPoint, bestPart
+    local half = body.Size * 0.5 + Vector3.new(radius, radius, radius)
+
+    -- Shooting from below (UG / anti-ESP pose): bias the pick
+    -- towards the underside of the hull. From an underground origin the
+    -- shallow under-map lines are the ones that actually register, so the
+    -- lowest clear sample beats an arbitrary first hit. When the origin is
+    -- level with or above the body the bias is zero and the most central
+    -- clear sample wins instead. Every clear sample is scored (the old code
+    -- stopped at the first one, which was order-dependent and often the
+    -- wrong side of the hull).
+    local below = origin.Y < body.Position.Y - 1
+    local toBody = body.Position - origin
+    local axis = toBody.Magnitude > 0.01 and toBody.Unit or Vector3.yAxis
+
+    local bestPoint, bestPart, bestScore
     for i = 1, count do
         local y = 1 - 2 * ((i - 0.5) / count)
         local radial = math.sqrt(math.max(0, 1 - y * y))
         local angle = i * golden
         local unit = Vector3.new(math.cos(angle) * radial, y, math.sin(angle) * radial)
-        local half = body.Size * 0.5 + Vector3.new(radius, radius, radius)
-        local point = body.CFrame:PointToWorldSpace(Vector3.new(unit.X * half.X, unit.Y * half.Y, unit.Z * half.Z))
+        local localPoint = Vector3.new(unit.X * half.X, unit.Y * half.Y, unit.Z * half.Z)
+        local point = body.CFrame:PointToWorldSpace(localPoint)
         local delta = point - origin
         if delta.Magnitude > 0.01 then
             local hit = workspace:Raycast(origin, delta * 1.01, params)
             if not hit or hit.Instance:IsDescendantOf(character) then
-                bestPoint, bestPart = point, body
-                break
+                -- Lower score = better. Lateral distance off the origin->body
+                -- line keeps the shot central; the underside bias (negative
+                -- local Y = lower half) pulls it down when we shoot from below.
+                local along = delta:Dot(axis)
+                local lateral = (delta - axis * along).Magnitude
+                local score = lateral
+                if below then score += localPoint.Y * 0.6 end
+                if not bestScore or score < bestScore then
+                    bestPoint, bestPart, bestScore = point, body, score
+                end
             end
         end
     end
@@ -1122,13 +1297,13 @@ do -- combat
     local FailsafePending = false;
     local FailsafeLastForce = 0;
 
-    local function FailsafeReady()
+    local function _FailsafeReady()
         return FailsafeEnabled and FailsafeMissStreak >= FailsafeAttempts;
     end
 
     -- Failsafe trigger now happens inside FailsafeWatch the moment the miss
-    -- limit is reached. Kept as a no-op so the shot paths still compile.
-    local function FailsafeApply() end
+    -- limit is reached. Kept as a no-op for reference.
+    local function _FailsafeApply() end
 
     -- Published so the advanced-aa section (a later scope) can drive the
     -- failsafe. Writing to `FailsafeEnabled` from there used to hit a global
@@ -1153,7 +1328,7 @@ do -- combat
     -- the streak resets, and UG comes back on its own. Misses while UG is
     -- off or already paused are not counted.
     local function FailsafeWatch(targetPlayer)
-        if not FailsafeEnabled or not targetPlayer or FailsafePending then return end
+        if not (FailsafeEnabled or AAAutoDepthOn()) or not targetPlayer or FailsafePending then return end
         if AADesync() < 0.25 then return end -- UG not active: nothing to fail
         local character = targetPlayer.Character
         local humanoid = character and character:FindFirstChildOfClass("Humanoid")
@@ -1165,12 +1340,14 @@ do -- combat
             if not humanoid.Parent then return end
             if humanoid.Health < before then
                 FailsafeMissStreak = 0;
+                AAFeedback(true);
                 return
             end
             -- UG got paused/disabled while waiting: do not count this one.
             if AADesync() < 0.25 then return end
+            AAFeedback(false);
             FailsafeMissStreak += 1;
-            if FailsafeMissStreak >= FailsafeAttempts
+            if FailsafeEnabled and FailsafeMissStreak >= FailsafeAttempts
                 and os.clock() - FailsafeLastForce >= FailsafeSyncTime then
                 FailsafeMissStreak = 0;
                 FailsafeLastForce = os.clock();
@@ -1523,17 +1700,218 @@ do -- combat
 
     --#region targetting
 
+        -- Draw order, bottom to top: shadow halo -> fill -> outline. Created in
+        -- that order so each layer paints over the previous one.
+        local FovShadow = Drawing.new("Circle")
+        FovShadow.Filled = false
+        FovShadow.Color = Color3.fromRGB(0, 0, 0)
+        FovShadow.Transparency = 0.5
+        FovShadow.Visible = false
+
+        local FovFill = Drawing.new("Circle")
+        FovFill.Filled = true
+        FovFill.Transparency = 0.85
+        FovFill.Visible = false
+
         local FovCircle = Drawing.new("Circle")
 
         FovCircle.Radius = 100
         FovCircle.Color = Color3.fromRGB(255, 255, 255)
         FovCircle.Visible = false
 
-        local _fovconnection = RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function()
-            if FovCircleEnabled then 
-                FovCircle.Position = UserInputService:GetMouseLocation()
+        FovFill.Radius = FovCircle.Radius
+        FovFill.Color = FovCircle.Color
+        FovShadow.Radius = FovCircle.Radius
+
+        -- FOV outline shape. "Sides" draws a regular polygon (3 = triangle,
+        -- 6 = hexagon, ... up to 1000 = smooth, where the library Circle takes
+        -- over); the star toggle draws a Star of David (two triangles) instead.
+        -- Spin rotates the shape continuously, thickness sets the line width,
+        -- fill paints the interior, rainbow cycles the colour and shadow lays a
+        -- dark, wider halo under the outline so it reads as blurred/darkened.
+        local FovShape = {
+            Sides = 1000,
+            Star = false,
+            Spin = 90,            -- degrees/second, positive = CLOCKWISE (0 = static)
+            Thickness = 1,
+            Fill = false,
+            FillTransparency = 0.85,
+            Rainbow = false,
+            RainbowSpeed = 0.5,   -- colour cycles per second
+            Shadow = false,
+            ShadowColor = Color3.fromRGB(0, 0, 0),
+            ShadowTransparency = 0.5,
+        }
+        do
+            local FOV_SMOOTH_AT = 64
+            local lines, tris, shadows = {}, {}, {}
+            local angle = 0
+            local hue = 0
+
+            local function ensureLines(count)
+                while #lines < count do
+                    local line = Drawing.new("Line")
+                    line.Visible = false
+                    line.Thickness = 1
+                    line.Transparency = 1
+                    lines[#lines + 1] = line
+                end
             end
-        end))
+
+            local function ensureTris(count)
+                while #tris < count do
+                    local tri = Drawing.new("Triangle")
+                    tri.Visible = false
+                    tri.Transparency = 1
+                    tris[#tris + 1] = tri
+                end
+            end
+
+            local function ensureShadows(count)
+                while #shadows < count do
+                    local line = Drawing.new("Line")
+                    line.Visible = false
+                    line.Transparency = 1
+                    shadows[#shadows + 1] = line
+                end
+            end
+
+            local function hideLines()
+                for _, line in ipairs(lines) do
+                    if line.Visible then line.Visible = false end
+                end
+            end
+
+            local function hideTris()
+                for _, tri in ipairs(tris) do
+                    if tri.Visible then tri.Visible = false end
+                end
+            end
+
+            local function hideShadows()
+                for _, line in ipairs(shadows) do
+                    if line.Visible then line.Visible = false end
+                end
+            end
+
+            -- Closed polygons (each a list of Vector2 points) tracing the shape,
+            -- rotated by "rot" radians. The star is two triangles, the N-gon is
+            -- a single polygon. A non-smooth shape never exceeds 63 points, so
+            -- the pools are pre-built here in draw order: shadow (bottom), then
+            -- fill triangles, then outline lines (top).
+            ensureShadows(64)
+            ensureTris(64)
+            ensureLines(64)
+
+            local function outline(center, radius, star, rot)
+                local polygons = {}
+                if star then
+                    for _, base in ipairs({ -math.pi / 2, -math.pi / 2 + math.pi / 3 }) do
+                        local points = {}
+                        for i = 0, 2 do
+                            local a = base + rot + i * (math.pi * 2 / 3)
+                            points[#points + 1] = center
+                                + Vector2.new(math.cos(a), math.sin(a)) * radius
+                        end
+                        polygons[#polygons + 1] = points
+                    end
+                    return polygons
+                end
+                local count = math.clamp(math.floor(FovShape.Sides + 0.5), 3, 1000)
+                local points = {}
+                for i = 0, count - 1 do
+                    local a = -math.pi / 2 + rot + i * (math.pi * 2 / count)
+                    points[#points + 1] = center
+                        + Vector2.new(math.cos(a), math.sin(a)) * radius
+                end
+                polygons[#polygons + 1] = points
+                return polygons
+            end
+
+            local function render(dt)
+                local step = math.clamp(dt or 0.016, 0, 0.1)
+                angle = (angle + math.rad(FovShape.Spin) * step) % (math.pi * 2)
+                hue = (hue + step * FovShape.RainbowSpeed) % 1
+                if not FovCircleEnabled then
+                    if FovCircle.Visible then FovCircle.Visible = false end
+                    if FovFill.Visible then FovFill.Visible = false end
+                    if FovShadow.Visible then FovShadow.Visible = false end
+                    hideLines()
+                    hideTris()
+                    hideShadows()
+                    return
+                end
+                local center = UserInputService:GetMouseLocation()
+                local radius = FovCircle.Radius
+                local color = FovShape.Rainbow and Color3.fromHSV(hue, 1, 1) or FovCircle.Color
+                local fillAlpha = FovShape.Fill and FovShape.FillTransparency or 1
+                local thickness = FovShape.Thickness
+                FovCircle.Position = center
+                FovCircle.Thickness = thickness
+                FovCircle.Color = color
+                FovFill.Position = center
+                FovFill.Radius = radius
+                FovFill.Color = color
+                FovFill.Transparency = fillAlpha
+                FovShadow.Position = center
+                FovShadow.Radius = radius
+                FovShadow.Thickness = thickness + 3
+                FovShadow.Transparency = FovShape.ShadowTransparency
+                local smooth = (not FovShape.Star) and FovShape.Sides >= FOV_SMOOTH_AT
+                FovCircle.Visible = smooth
+                FovFill.Visible = smooth and FovShape.Fill
+                FovShadow.Visible = smooth and FovShape.Shadow
+                if smooth then
+                    hideLines()
+                    hideTris()
+                    hideShadows()
+                    return
+                end
+                FovFill.Visible = false
+                FovShadow.Visible = false
+                local polygons = outline(center, radius, FovShape.Star, angle)
+                local li, ti, si = 0, 0, 0
+                for _, points in ipairs(polygons) do
+                    local n = #points
+                    for i = 1, n do
+                        local a, b = points[i], points[i % n + 1]
+                        if FovShape.Shadow then
+                            si += 1
+                            local shadow = shadows[si]
+                            shadow.From = a
+                            shadow.To = b
+                            shadow.Color = FovShape.ShadowColor
+                            shadow.Thickness = thickness + 3
+                            shadow.Transparency = FovShape.ShadowTransparency
+                            shadow.Visible = true
+                        end
+                        li += 1
+                        local line = lines[li]
+                        line.From = a
+                        line.To = b
+                        line.Color = color
+                        line.Thickness = thickness
+                        line.Transparency = 1
+                        line.Visible = true
+                        if FovShape.Fill then
+                            ti += 1
+                            local tri = tris[ti]
+                            tri.PointA = center
+                            tri.PointB = a
+                            tri.PointC = b
+                            tri.Color = color
+                            tri.Transparency = fillAlpha
+                            tri.Visible = true
+                        end
+                    end
+                end
+                for i = li + 1, #lines do lines[i].Visible = false end
+                for i = ti + 1, #tris do tris[i].Visible = false end
+                for i = si + 1, #shadows do shadows[i].Visible = false end
+            end
+
+            local _fovconnection = RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(render))
+        end
 
         function GetTarget()
             local currentCamera = workspace.CurrentCamera
@@ -2747,7 +3125,6 @@ do -- combat
             Default = false; 
             Callback = function(v)
                 FovCircleEnabled = v;
-                FovCircle.Visible = v;
             end 
         })
 
@@ -2760,6 +3137,117 @@ do -- combat
             Decimals = 1;
             Callback = function(v)
                 FovCircle.Radius = v;
+            end 
+        })
+
+        -- Polygon sides: 3 = triangle ... 1000 = smooth. Values at/above 64
+        -- are drawn as the smooth circle (a 64-gon already looks round), so the
+        -- top of the slider is just "smooth".
+        Sections.aimbot:Slider({
+            Name = 'fov sides (3 = triangle, 1000 = smooth)';
+            Flag = 'fovsides';
+            Default = 1000;
+            Max = 1000;
+            Min = 3;
+            Decimals = 0;
+            Callback = function(v)
+                FovShape.Sides = v;
+            end 
+        })
+
+        Sections.aimbot:Toggle({
+            Name = 'star of david fov';
+            Flag = 'fovstar';
+            Default = false;
+            Callback = function(v)
+                FovShape.Star = v;
+            end 
+        })
+
+        Sections.aimbot:Slider({
+            Name = 'fov spin (deg/s clockwise, 0 = off)';
+            Flag = 'fovspin';
+            Default = 90;
+            Max = 720;
+            Min = 0;
+            Decimals = 0;
+            Callback = function(v)
+                FovShape.Spin = v;
+            end 
+        })
+
+        Sections.aimbot:Slider({
+            Name = 'fov thickness';
+            Flag = 'fovthickness';
+            Default = 1;
+            Max = 10;
+            Min = 1;
+            Decimals = 0;
+            Callback = function(v)
+                FovShape.Thickness = v;
+            end 
+        })
+
+        Sections.aimbot:Toggle({
+            Name = 'fov fill';
+            Flag = 'fovfill';
+            Default = false;
+            Callback = function(v)
+                FovShape.Fill = v;
+            end 
+        })
+
+        Sections.aimbot:Slider({
+            Name = 'fov fill transparency';
+            Flag = 'fovfilltransparency';
+            Default = 0.85;
+            Max = 1;
+            Min = 0;
+            Decimals = 0.05;
+            Callback = function(v)
+                FovShape.FillTransparency = v;
+            end 
+        })
+
+        Sections.aimbot:Toggle({
+            Name = 'fov rainbow';
+            Flag = 'fovrainbow';
+            Default = false;
+            Callback = function(v)
+                FovShape.Rainbow = v;
+            end 
+        })
+
+        Sections.aimbot:Slider({
+            Name = 'fov rainbow speed';
+            Flag = 'fovrainbowspeed';
+            Default = 0.5;
+            Max = 3;
+            Min = 0.05;
+            Decimals = 0.05;
+            Callback = function(v)
+                FovShape.RainbowSpeed = v;
+            end 
+        })
+
+        Sections.aimbot:Toggle({
+            Name = 'fov shadow';
+            Flag = 'fovshadow';
+            Default = false;
+            Callback = function(v)
+                FovShape.Shadow = v;
+            end 
+        })
+
+        Sections.aimbot:Slider({
+            Name = 'fov shadow transparency';
+            Flag = 'fovshadowtransparency';
+            Default = 0.5;
+            Max = 1;
+            Min = 0;
+            Decimals = 0.05;
+            Callback = function(v)
+                FovShape.ShadowTransparency = v;
             end 
         })
 
@@ -2901,6 +3389,40 @@ do -- combat
                 end;
             })
 
+            -- Team whitelists: pick which teams the aim and the ESP are
+            -- allowed to see. Multi-select and empty = every team, so
+            -- leaving them untouched changes nothing. The labels are the
+            -- game's team names; TEAM_WHITELIST_ROLES maps them onto the
+            -- internal roles used by TeamRole().
+            Sections.aimbot:Dropdown({
+                Name = 'aim team whitelist (empty = all)';
+                Flag = 'aimteamwhitelist';
+                Items = TEAM_WHITELIST_ITEMS;
+                Multi = true;
+                Default = {};
+                Callback = function(v)
+                    table.clear(AimTeamWhitelist)
+                    for _, label in ipairs(v) do
+                        local role = TEAM_WHITELIST_ROLES[label]
+                        if role then AimTeamWhitelist[role] = true end
+                    end
+                end;
+            })
+            Sections.aimbot:Dropdown({
+                Name = 'esp team whitelist (empty = all)';
+                Flag = 'espteamwhitelist';
+                Items = TEAM_WHITELIST_ITEMS;
+                Multi = true;
+                Default = {};
+                Callback = function(v)
+                    table.clear(ESPTeamWhitelist)
+                    for _, label in ipairs(v) do
+                        local role = TEAM_WHITELIST_ROLES[label]
+                        if role then ESPTeamWhitelist[role] = true end
+                    end
+                end;
+            })
+
             local function RefreshPlayerLists()
                 whitelistDrop:Refresh(PlayerNameList())
                 blacklistDrop:Refresh(PlayerNameList())
@@ -2977,13 +3499,93 @@ end
 
 
 -- Apply shared policy after the external ESP library has positioned its holders.
+-- This now also runs when "team priority" is off but an ESP team whitelist is
+-- set, because the team filter has to work independently of the priority
+-- toggle. Entries are hidden by us (and their library visibility restored
+-- when they become allowed again) instead of being permanently muted.
+local espFilterHidden = setmetatable({}, { __mode = "k" })
 RunService:BindToRenderStep("PriorityESPFilter", Enum.RenderPriority.Camera.Value + 2, function()
-    if not PriorityTeamCheck or not EspLib.Cache then return end
+    if not EspLib.Cache then return end
+    local filterActive = PriorityTeamCheck or next(ESPTeamWhitelist) ~= nil
+    if not filterActive then return end
     for plr, entry in pairs(EspLib.Cache) do
-        if not TargetPriority(plr) and not WhitelistedPlayers[plr.Name] and entry.Holder then
-            entry.Holder.Visible = false
-            -- Keep the library's visibility state consistent so it can show it again.
+        -- Team whitelist first (it restricts even name-whitelisted players),
+        -- then the normal priority/team policy and the name whitelist.
+        local allowed = TeamWhitelistAllows(ESPTeamWhitelist, plr)
+            and (WhitelistedPlayers[plr.Name] or not PriorityTeamCheck or TargetPriority(plr) ~= nil)
+        if not allowed then
+            if espFilterHidden[plr] == nil then espFilterHidden[plr] = entry.Visible end
+            if entry.Holder then entry.Holder.Visible = false end
             entry.Visible = false
+        elseif espFilterHidden[plr] ~= nil then
+            -- Allowed again: hand the library its own visibility state back.
+            local was = espFilterHidden[plr]
+            espFilterHidden[plr] = nil
+            local tableEnabled = type(EspLib.Table) == "table" and EspLib.Table.Enabled
+            if tableEnabled then
+                entry.Visible = was
+                if entry.Holder then entry.Holder.Visible = was end
+            end
+        end
+    end
+    -- Drop saved states for players the library no longer tracks.
+    for plr in pairs(espFilterHidden) do
+        if not EspLib.Cache[plr] then espFilterHidden[plr] = nil end
+    end
+end)
+
+-- ESP presentation. The library scales its box with distance (Factor / depth),
+-- so a player standing next to you fills the screen with a giant rectangle.
+-- This caps every box at a fixed maximum pixel size and re-centres it on the
+-- same screen point, then paints priority / blacklisted players a solid
+-- highlight colour (everyone else keeps the library's own gradient). It runs
+-- after the library's own render step (Camera + 1) and after PriorityESPFilter
+-- (Camera + 2), so it wins each frame and skips entries the filter hid.
+local espSizeCap = 80
+local espHighlight = true
+local espPriorityColor = Color3.fromRGB(255, 200, 60)
+local espBlacklistColor = Color3.fromRGB(255, 70, 70)
+
+local function ESPDefaultBoxColor()
+    local box = EspLib.Table.Boxes.Box
+    return ColorSequence.new(box.Bot, box.Top)
+end
+local function ESPDefaultFillColor()
+    local fill = EspLib.Table.Boxes.Fill
+    return ColorSequence.new(fill.Bot, fill.Top)
+end
+-- nil = leave the library colour alone; otherwise the solid colour to paint.
+local function ESPHighlightColor(plr)
+    if not espHighlight or plr == LocalPlayer then return nil end
+    if BlacklistedPlayers[plr.Name] then return espBlacklistColor end
+    if PriorityTeamCheck and TargetPriority(plr) ~= nil then return espPriorityColor end
+    return nil
+end
+
+RunService:BindToRenderStep("ESPOverlay", Enum.RenderPriority.Camera.Value + 3, function()
+    local cache = EspLib.Cache
+    if not cache then return end
+    for plr, entry in pairs(cache) do
+        if entry.Visible and entry.Holder then
+            local h, w = entry.Height, entry.Width
+            if h and w and h > espSizeCap and w > 0 then
+                local cw = math.max(math.floor(w * (espSizeCap / h) + 0.5), 1)
+                local cx, cy = entry.X + w * 0.5, entry.Y + h * 0.5
+                entry.Holder.Size = UDim2.fromOffset(cw, espSizeCap)
+                entry.Holder.Position = UDim2.fromOffset(
+                    math.floor(cx - cw * 0.5 + 0.5),
+                    math.floor(cy - espSizeCap * 0.5 + 0.5))
+            end
+            local color = ESPHighlightColor(plr)
+            if color then
+                entry.BoxGradient.Color = ColorSequence.new(color)
+                entry.FillGradient.Color = ColorSequence.new(color)
+                entry.EspRecolored = true
+            elseif entry.EspRecolored then
+                entry.BoxGradient.Color = ESPDefaultBoxColor()
+                entry.FillGradient.Color = ESPDefaultFillColor()
+                entry.EspRecolored = false
+            end
         end
     end
 end)
@@ -3155,6 +3757,39 @@ do -- esp
             EspLib['Table']['Distance'] = v
         end
     })
+
+    -- Keep the on-screen box small and readable: boxes are capped at this
+    -- pixel height (the width follows the library's own aspect ratio).
+    Sections.Esp:Slider({
+        Name = 'max box size (px)';
+        Flag = 'espmaxboxsize';
+        Min = 20;
+        Max = 300;
+        Default = 80;
+        Decimals = 0;
+        Callback = function(v) espSizeCap = v end
+    })
+
+    Sections.Esp:Toggle({
+        Name = 'highlight priority / blacklist';
+        Flag = 'esphighlight';
+        Default = true;
+        Callback = function(v) espHighlight = v end
+    })
+
+    Sections.Esp:Label({Name = 'priority color'}):Colorpicker({
+        Name = 'priority color';
+        Flag = 'espprioritycolor';
+        Default = espPriorityColor;
+        Callback = function(v) espPriorityColor = v end
+    })
+
+    Sections.Esp:Label({Name = 'blacklist color'}):Colorpicker({
+        Name = 'blacklist color';
+        Flag = 'espblacklistcolor';
+        Default = espBlacklistColor;
+        Callback = function(v) espBlacklistColor = v end
+    })
 end
 
 
@@ -3264,10 +3899,20 @@ local function GhostCreate(character)
             object.CanTouch = false
             object.CanQuery = false
 
-            object:SetAttribute(
-                "GhostOriginalTransparency",
-                object.Transparency
-            )
+            -- If the character was cloned while invisibility had painted it,
+            -- the parts came over at Transparency = 1. Use the transparency the
+            -- invisibility block stashed on the part so the ghost stays visible
+            -- and keeps tracking even while you are invisible.
+            local original = object:GetAttribute("InvisibleOriginalTransparency")
+            if original == nil then original = object.Transparency end
+
+            object:SetAttribute("GhostOriginalTransparency", original)
+
+        elseif object:IsA("Decal") or object:IsA("Texture") then
+            -- Same idea for faces / textures: invisibility painted them too,
+            -- so pull the stashed value back so the ghost's face still shows.
+            local original = object:GetAttribute("InvisibleOriginalTransparency")
+            if original ~= nil then object.Transparency = original end
         end
     end
 
@@ -3292,6 +3937,9 @@ local function GhostCreate(character)
     GhostRootOffset = root.CFrame:ToObjectSpace(character:GetPivot())
 
     Ghost:PivotTo(character:GetPivot())
+    -- Created on the client and parented to workspace: local instances are not
+    -- replicated, so other players never receive this clone (it cannot reveal
+    -- your position to them).
     Ghost.Parent = workspace
 
     GhostSetFade(0)
@@ -4901,6 +5549,298 @@ local _InfiniteJumpConnection =
 --#endregion
 
 
+--#region remove doors
+
+    -- Client-side only: makes every door part of the map non-collidable and
+    -- invisible so you can walk straight through it. The server still owns the
+    -- real door, so this is a movement shortcut, not a server-side remover.
+    do
+        local DoorRemoval = {
+            Enabled = false,
+            -- Weak keys: a door that is destroyed / streamed out drops its
+            -- saved properties instead of pinning the instance forever.
+            Originals = WeakKeyedTable(),
+            Connection = nil,
+        }
+
+        -- A door is a part whose own name, or the name of one of its three
+        -- nearest containers, contains "door" or "gate". That catches the
+        -- game's "Door", "CellDoor", "Door1" ... parts, anything inside a
+        -- "Doors"/"Gates" folder, and model-based doors (e.g. a "CellDoor"
+        -- model with a part called "Part") without touching the rest of the map.
+        local function IsDoor(part)
+            if not part:IsA("BasePart") then return false end
+            local character = LocalPlayer.Character
+            if character and part:IsDescendantOf(character) then return false end
+            local name = string.lower(part.Name)
+            if name:find("door", 1, true) or name:find("gate", 1, true) then
+                return true
+            end
+            local ancestor, depth = part.Parent, 0
+            while ancestor and ancestor ~= workspace and depth < 3 do
+                local ancestorName = string.lower(ancestor.Name)
+                if ancestorName:find("door", 1, true)
+                    or ancestorName:find("gate", 1, true) then
+                    return true
+                end
+                ancestor, depth = ancestor.Parent, depth + 1
+            end
+            return false
+        end
+
+        local function StripDoor(part)
+            if DoorRemoval.Originals[part] or not part.Parent or not IsDoor(part) then
+                return
+            end
+            DoorRemoval.Originals[part] = {
+                CanCollide = part.CanCollide,
+                CanQuery = part.CanQuery,
+                CanTouch = part.CanTouch,
+                Transparency = part.Transparency,
+                CastShadow = part.CastShadow,
+            }
+            part.CanCollide = false
+            part.CanQuery = false
+            part.CanTouch = false
+            part.CastShadow = false
+            part.Transparency = 1
+        end
+
+        local function RestoreDoors()
+            for part, saved in pairs(DoorRemoval.Originals) do
+                if part.Parent then
+                    part.CanCollide = saved.CanCollide
+                    part.CanQuery = saved.CanQuery
+                    part.CanTouch = saved.CanTouch
+                    part.Transparency = saved.Transparency
+                    part.CastShadow = saved.CastShadow
+                end
+                DoorRemoval.Originals[part] = nil
+            end
+        end
+
+        local function SweepDoors()
+            for _, object in ipairs(workspace:GetDescendants()) do
+                if object:IsA("BasePart") then
+                    StripDoor(object)
+                end
+            end
+        end
+
+        local function SetDoorRemoval(enabled)
+            DoorRemoval.Enabled = enabled
+            if DoorRemoval.Connection then
+                DoorRemoval.Connection:Disconnect()
+                DoorRemoval.Connection = nil
+            end
+            if enabled then
+                SweepDoors()
+                -- Round resets rebuild the map. New parts are caught as they
+                -- arrive; the delayed re-sweep covers a map that was already
+                -- parented into workspace when the toggle was switched on.
+                task.delay(1, function()
+                    if DoorRemoval.Enabled then SweepDoors() end
+                end)
+                DoorRemoval.Connection = workspace.DescendantAdded:Connect(function(object)
+                    if DoorRemoval.Enabled and object:IsA("BasePart") then
+                        task.defer(function()
+                            if DoorRemoval.Enabled then StripDoor(object) end
+                        end)
+                    end
+                end)
+            else
+                RestoreDoors()
+            end
+        end
+
+        Sections.exploits:Toggle({
+            Name = "remove doors";
+            Flag = "removedoors";
+            Default = false;
+            Callback = function(value)
+                SetDoorRemoval(value);
+            end;
+        })
+    end
+
+--#endregion
+
+
+--#region invisibility
+
+    -- Invisibility: hides your real SERVER body. Every part, accessory, decal
+    -- and equipped tool on the character is made fully transparent locally (so
+    -- nothing of you renders on your own screen), AND the server pose is parked
+    -- straight down under the floor by the advanced-aa engine - the same hide
+    -- mechanism anti-ESP uses, but static (no lateral orbit, no reroll). Other
+    -- clients therefore never receive a visible pose to draw an ESP box / chams
+    -- from. Your own body and camera are restored every frame, so you stay
+    -- where the game put you and interaction keeps working (the engine pauses
+    -- the hide on E / ClickDetectors / proximity prompts).
+    do
+        local Invisible = {
+            Enabled = false,
+            Saved = WeakKeyedTable(),
+            Connections = {},
+            Character = nil,
+            LastSweep = 0,
+        }
+
+        -- The original transparency is also mirrored onto the part as an
+        -- attribute, so the latency-ghost clone (which is cloned FROM this
+        -- character) can tell what each part looked like before invisibility
+        -- painted it and keep the ghost visible instead of inheriting the
+        -- fully-transparent values.
+        local function Save(object)
+            if Invisible.Saved[object] then return end
+            if object:IsA("BasePart") then
+                Invisible.Saved[object] = { Kind = "part", Value = object.Transparency }
+                pcall(function()
+                    object:SetAttribute("InvisibleOriginalTransparency", object.Transparency)
+                end)
+            elseif object:IsA("Decal") or object:IsA("Texture") then
+                Invisible.Saved[object] = { Kind = "decal", Value = object.Transparency }
+                pcall(function()
+                    object:SetAttribute("InvisibleOriginalTransparency", object.Transparency)
+                end)
+            end
+        end
+
+        local function Paint(object)
+            if object:IsA("BasePart") or object:IsA("Decal") or object:IsA("Texture") then
+                Save(object)
+                if object.Transparency ~= 1 then object.Transparency = 1 end
+            end
+        end
+
+        local function Restore()
+            for object, saved in pairs(Invisible.Saved) do
+                if object.Parent then
+                    pcall(function() object.Transparency = saved.Value end)
+                    pcall(function() object:SetAttribute("InvisibleOriginalTransparency", nil) end)
+                end
+            end
+            table.clear(Invisible.Saved)
+        end
+
+        local function Sweep()
+            local character = Invisible.Character
+            if not character or not character.Parent then return end
+            for _, object in ipairs(character:GetDescendants()) do
+                Paint(object)
+            end
+            local humanoid = character:FindFirstChildOfClass("Humanoid")
+            if humanoid then
+                humanoid.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+                humanoid.HealthDisplayType = Enum.HumanoidHealthDisplayType.AlwaysOff
+            end
+        end
+
+        local function Disconnect()
+            for _, connection in ipairs(Invisible.Connections) do
+                pcall(function() connection:Disconnect() end)
+            end
+            table.clear(Invisible.Connections)
+        end
+
+        local function BindTool(tool)
+            if not tool:IsA("Tool") then return end
+            for _, object in ipairs(tool:GetDescendants()) do
+                Paint(object)
+            end
+        end
+
+        local function Watch(character)
+            Disconnect()
+            Restore()
+            Invisible.Character = character
+            if not character or not Invisible.Enabled then return end
+            Sweep()
+            task.spawn(function()
+                -- A respawned rig exists before the game finishes setting it
+                -- up, so re-sweep twice over the next second.
+                for _ = 1, 2 do
+                    task.wait(0.45)
+                    if not Invisible.Enabled or Invisible.Character ~= character then return end
+                    Sweep()
+                end
+            end)
+            table.insert(Invisible.Connections, character.DescendantAdded:Connect(function(object)
+                if not Invisible.Enabled then return end
+                task.defer(function()
+                    if Invisible.Enabled then Paint(object) end
+                end)
+            end))
+            table.insert(Invisible.Connections, character.ChildAdded:Connect(function(object)
+                if not (Invisible.Enabled and object:IsA("Tool")) then return end
+                BindTool(object)
+            end))
+            for _, child in ipairs(character:GetChildren()) do
+                if child:IsA("Tool") then BindTool(child) end
+            end
+        end
+
+        local function SetEnabled(value)
+            Invisible.Enabled = value
+            -- Drive the static server-body hide in the advanced-aa engine.
+            local bridge = (type(getgenv) == "function" and getgenv()) or _G
+            if type(bridge.AdvancedAASetInvisible) == "function" then
+                pcall(bridge.AdvancedAASetInvisible, value)
+            end
+            if value then
+                Watch(LocalPlayer.Character)
+            else
+                Restore()
+                Disconnect()
+                Invisible.Character = nil
+            end
+        end
+
+        LocalPlayer.CharacterAdded:Connect(function(character)
+            if not Invisible.Enabled then return end
+            task.defer(function()
+                if Invisible.Enabled then Watch(character) end
+            end)
+        end)
+
+        -- Damage flashes, respawns and tool equips can rewrite Transparency.
+        -- The sweep only touches values that actually changed.
+        RunService.Heartbeat:Connect(function()
+            if not Invisible.Enabled then return end
+            local now = os.clock()
+            if now - Invisible.LastSweep < 0.1 then return end
+            Invisible.LastSweep = now
+            local character = LocalPlayer.Character
+            if not character then return end
+            if character ~= Invisible.Character then
+                Watch(character)
+                return
+            end
+            for _, object in ipairs(character:GetDescendants()) do
+                if (object:IsA("BasePart") or object:IsA("Decal") or object:IsA("Texture"))
+                    and object.Transparency ~= 1 then
+                    Paint(object)
+                end
+            end
+        end)
+
+        -- Hides your real server body (static hide under the floor) and makes
+        -- you transparent locally. Stays on until you switch it off; there is
+        -- no interaction timer because the engine already pauses the hide when
+        -- you use E / ClickDetectors / prompts.
+        Sections.exploits:Toggle({
+            Name = "invisibility (hide server body)";
+            Flag = "invisibility";
+            Default = false;
+            Callback = function(value)
+                SetEnabled(value);
+            end;
+        })
+    end
+
+--#endregion
+
+
 -- ==========================================
 -- INVAL TIMER - STANDALONE LOCAL SCRIPT
 -- ==========================================
@@ -5196,6 +6136,68 @@ Sections.movement:Toggle({
                 HitSoundVolume = v;
             end
         })
+
+        -- Animated X + ring where the shot landed. Headshots and kills use
+        -- their own colours.
+        Sections.hit:Toggle({
+            Name = 'hitmarkers';
+            Flag = 'hitmarkers';
+            Default = false;
+            Callback = function(v)
+                Hitmarker.Enabled = v;
+            end
+        })
+
+        Sections.hit:Slider({
+            Name = 'hitmarker size';
+            Flag = 'hitmarkersize';
+            Default = 16;
+            Min = 6;
+            Max = 48;
+            Decimals = 1;
+            Callback = function(v)
+                Hitmarker.Size = v;
+            end
+        })
+
+        Sections.hit:Slider({
+            Name = 'hitmarker duration (s)';
+            Flag = 'hitmarkerduration';
+            Default = 0.45;
+            Min = 0.15;
+            Max = 1.5;
+            Decimals = 0.05;
+            Callback = function(v)
+                Hitmarker.Duration = v;
+            end
+        })
+
+        Sections.hit:Label({Name = 'hitmarker color'}):Colorpicker({
+            Name = 'hitmarker color';
+            Flag = 'hitmarkercolor';
+            Default = Hitmarker.Color;
+            Callback = function(v)
+                Hitmarker.Color = v;
+            end
+        })
+
+        Sections.hit:Label({Name = 'headshot color'}):Colorpicker({
+            Name = 'headshot color';
+            Flag = 'hitmarkerheadcolor';
+            Default = Hitmarker.HeadColor;
+            Callback = function(v)
+                Hitmarker.HeadColor = v;
+            end
+        })
+
+        Sections.hit:Label({Name = 'kill color'}):Colorpicker({
+            Name = 'kill color';
+            Flag = 'hitmarkerkillcolor';
+            Default = Hitmarker.KillColor;
+            Callback = function(v)
+                Hitmarker.KillColor = v;
+            end
+        })
     --#endregion
 end 
 
@@ -5214,6 +6216,13 @@ end
 --     spoofed pose through the peek machinery, exactly like underground -
 --     we keep hitting them while they cannot hit us. Square / prism can be
 --     combined with it and then orbit around the spoofed centre.
+--
+-- Invisibility ("invisibility" toggle in the exploits section):
+--   * The same hide mechanism as anti-ESP, but STATIC: the server body is
+--     dropped straight under the floor at its own XZ and left there - no
+--     lateral orbit and no reroll - so other clients never receive a visible
+--     pose to draw an ESP box / chams from. Your own body and camera are
+--     restored every frame, so you do not see the movement.
 --
 -- Position-based shapes (square / prism):
 --   * Square walks the server position around a square loop in the XZ
@@ -5297,14 +6306,25 @@ do
         -- shooting. Turn this OFF to fall back to the shot-pose freeze
         -- (rock-solid validation, but the pose sits still while firing).
         SmoothShots = true,
-        -- Anti-ESP character spoof (HvH): displaces the pose everyone ELSE
-        -- reads far away in a random horizontal direction and under the map,
-        -- so enemy ESP draws the wrong box and their aimbot's visibility
-        -- check (raycast to the head) always fails. Our own aim compensates
-        -- through the regular bridges, so we can still target them.
+        -- Anti-ESP character spoof (HvH): parks the pose everyone ELSE reads
+        -- inside solid geometry - under the floor, inside a nearby wall /
+        -- building part, or (fallback) far away under the map. Enemy ESP
+        -- therefore draws a wrong / enclosed box and their aimbot's
+        -- visibility check (raycast to the head) fails. Our own aim
+        -- compensates through the same bridges, so we still hit them.
         AntiESP = false,
+        -- auto = pick the best available hiding spot each reroll,
+        -- underground / wall = force that kind, far = old far-away spoof.
+        AntiESPMode = "auto",
         AntiESPDistance = 60,
         AntiESPReroll = 3,
+        -- Invisibility: driven by the "invisibility" toggle in the exploits
+        -- section. It parks the server body STRAIGHT DOWN under the floor at
+        -- the same XZ - the same hide mechanism as anti-ESP, but static (no
+        -- lateral orbit, no reroll) - so other clients never receive a visible
+        -- pose to draw an ESP box / chams from. The client body and camera are
+        -- restored every frame, so you do not see the movement.
+        Invisible = false,
         -- Omniscient: random sphere around the real root, in X/Y/Z. Radius is
         -- capped by the range slider, and the point is re-rolled on its own
         -- timer. Cancels UG (it already goes above and below ground).
@@ -5313,6 +6333,12 @@ do
         Range = 4,
         Height = 0,
         UndergroundDepth = 20,
+        -- Auto UG depth: one switch. A miss pushes the underground pose
+        -- deeper (deeper = shallower under-map line for HBE) and it never comes
+        -- back up, so it just settles past the depth where the under-shots
+        -- start landing. Starts from the depth slider and works for the UG
+        -- mode and the anti-ESP hide mode alike.
+        AutoDepth = false,
         -- Cycles per second. Kept slow on purpose: the server validates a
         -- shot against the pose snapshot it holds when the remote arrives, and
         -- character replication only lands a snapshot every ~50ms. A fast
@@ -5382,10 +6408,24 @@ do
     -- Pose bookkeeping for the aim: when did the server last get each pose.
     local lastDisplacedAt, lastRealAt = 0, os.clock()
     -- Shot peek state.
-    local peekUntil, peekStart, peekEndedAt = 0, 0, 0
+    local peekUntil, peekStart = 0, 0
     local PEEK_MAX, PEEK_COOLDOWN = 0.8, 0.4
     -- Shot-pose freeze state (see AdvancedAAFreeze below).
     local freezeUntil, frozenRootCF = 0, nil
+    -- Hidden-spot cache for anti-ESP (filled by HiddenOffset
+    -- further down). Declared here so the bridge callbacks above and the UI
+    -- callbacks below all share the same locals.
+    local hiddenSpot, hiddenSpotAt, hiddenMode = nil, 0, ""
+    -- Auto UG depth state (see AdvancedAAFeedback below). autoDepth overrides
+    -- the slider while the feature is on.
+    local autoDepth = nil
+    local AUTO_DEPTH_STEP, AUTO_DEPTH_CAP = 3, 24
+
+    -- Depth the underground pose / hide spot should use: the auto value when
+    -- the feature is on, the slider otherwise.
+    local function effectiveDepth()
+        return math.clamp(autoDepth or settings.UndergroundDepth, 1, 30)
+    end
 
     local function syncWindow()
         local ok, ping = pcall(function() return LocalPlayer:GetNetworkPing() end)
@@ -5451,12 +6491,13 @@ do
         return (t - lastDisplacedAt >= w) and "real" or "transition"
     end
     env.AdvancedAAPeek = function(seconds)
-        if not settings.ShotPeek or not settings.Enabled then return false end
+        if not settings.ShotPeek then return false end
+        if not (settings.Enabled or settings.AntiESP or settings.Invisible) then return false end
         -- Square / prism must keep orbiting to stay useful, so a peek there
         -- only holds the real pose for one shot window (~latency + a frame)
-        -- instead of the long UG cap. UG / anti-ESP poses are deliberately
-        -- unshootable, so those keep the full cap.
-        local cap = (settings.Underground or settings.AntiESP) and PEEK_MAX or 0.3
+        -- instead of the long UG cap. UG / anti-ESP / invisibility poses are
+        -- deliberately unshootable, so those keep the full cap.
+        local cap = (settings.Underground or settings.AntiESP or settings.Invisible) and PEEK_MAX or 0.3
         local t = now()
         if t < peekUntil then
             -- Already peeking: extend, but never past the cap.
@@ -5499,17 +6540,42 @@ do
 
     env.AdvancedAAPause = pauseAA
     env.AdvancedAAForceSync = forceSync
+    -- Invisibility bridge: the "invisibility" switch in the exploits section
+    -- parks the server body under the floor (static hide). Turning it off only
+    -- drops the pose when nothing else still needs it (anti-ESP / the AA).
+    env.AdvancedAASetInvisible = function(enabled)
+        settings.Invisible = enabled == true
+        if not settings.Invisible and not settings.AntiESP and not settings.Enabled then
+            restorePose()
+            clearServerPose()
+        end
+    end
+    -- Auto UG depth: the combat shot watcher reports every shot outcome while
+    -- a displaced pose is active. A miss deepens the pose one step (capped),
+    -- so it settles past the depth where the under-shots start landing.
+    env.AdvancedAAFeedback = function(hit)
+        if hit or not settings.AutoDepth then return end
+        autoDepth = math.min((autoDepth or settings.UndergroundDepth) + AUTO_DEPTH_STEP,
+            AUTO_DEPTH_CAP)
+        hiddenSpot, hiddenSpotAt = nil, 0
+    end
+    -- Flag combat reads to keep the shot watcher running even with the
+    -- failsafe off (see AAAutoDepthOn).
+    env.AdvancedAAAutoDepth = false
     env.AdvancedAAStatus = function()
-        return settings.Enabled == true, serverOffset.Magnitude, now() < forceSyncUntil
+        return (settings.Enabled or settings.AntiESP or settings.Invisible) == true,
+            serverOffset.Magnitude, now() < forceSyncUntil
     end
     -- Used by the aim: a moving square / prism keeps orbiting through a shot,
-    -- so the aim must not park it on the first occluded frame (UG / anti-ESP
-    -- poses are deliberately unshootable and still peek immediately).
+    -- so the aim must not park it on the first occluded frame (UG / anti-ESP /
+    -- invisibility poses are deliberately unshootable and still peek
+    -- immediately).
     env.AdvancedAAIsOrbit = function()
         return settings.Enabled == true
             and (settings.Square or settings.Prism or settings.Omniscient)
             and not settings.Underground
             and not settings.AntiESP
+            and not settings.Invisible
     end
     env.AdvancedAADesync = function()
         if now() < forceSyncUntil then return 0 end
@@ -5588,20 +6654,73 @@ do
         return v0:Lerp(v1, p - edge)
     end
 
-    -- Anti-ESP spoof offset: a random horizontal direction, re-rolled every
-    -- AntiESPReroll seconds, pushed under the map (so enemy raycast checks
-    -- to the head always fail) and far away (so their ESP box and distance
-    -- read nonsense). Under the floor the pose is invisible to every
-    -- visibility-gated aimbot, which is what "they can't target you" is.
-    local antiESPDir = Vector3.new(1, 0, 0)
-    local antiESPRerollAt = 0
-    local function AntiESPDirection()
-        if now() > antiESPRerollAt then
-            local angle = math.random() * math.pi * 2
-            antiESPDir = Vector3.new(math.cos(angle), 0, math.sin(angle))
-            antiESPRerollAt = now() + math.max(settings.AntiESPReroll, 0.5)
+    -- Anti-ESP hidden spot. Instead of a random far-away
+    -- spoof, the pose everyone ELSE reads is parked inside solid geometry
+    -- close to the real body, so their ESP box / chams sit inside a wall and
+    -- their aimbot's visibility ray to the head is stopped by that same
+    -- geometry. Three kinds, chosen by the "anti esp hide mode" dropdown:
+    --   underground - straight down under the floor (always available);
+    --   wall        - a ray is cast in eight horizontal directions and the
+    --                 pose is dropped just inside the first solid part hit;
+    --   far         - the old far-away under-map spoof, kept as a fallback.
+    -- auto tries wall first, then underground, then far.
+    local HIDDEN_DIRECTIONS = {
+        Vector3.new(1, 0, 0), Vector3.new(-1, 0, 0),
+        Vector3.new(0, 0, 1), Vector3.new(0, 0, -1),
+        Vector3.new(0.7071, 0, 0.7071), Vector3.new(-0.7071, 0, 0.7071),
+        Vector3.new(0.7071, 0, -0.7071), Vector3.new(-0.7071, 0, -0.7071),
+    }
+    local hiddenParams = RaycastParams.new()
+    hiddenParams.FilterType = Enum.RaycastFilterType.Exclude
+    hiddenParams.IgnoreWater = true
+
+    -- The picked spot is held for AntiESPReroll seconds so the pose does not
+    -- jitter every frame; it is re-picked on the timer or when the mode / the
+    -- spot cache is invalidated by the toggles (see hiddenSpot above).
+    local function HiddenOffset(root)
+        local mode = settings.AntiESPMode
+        local depth = effectiveDepth()
+        if hiddenSpot and now() < hiddenSpotAt and mode == hiddenMode then
+            return hiddenSpot
         end
-        return antiESPDir
+        hiddenMode = mode
+        hiddenSpotAt = now() + math.max(settings.AntiESPReroll, 0.5)
+
+        -- 1) A nearby wall / building to sit inside.
+        if mode == "wall" or mode == "auto" then
+            hiddenParams.FilterDescendantsInstances = AAIgnoreList()
+            local origin = root.Position
+            for _, dir in ipairs(HIDDEN_DIRECTIONS) do
+                local hit = workspace:Raycast(origin, dir * 60, hiddenParams)
+                if hit and IsCover(hit.Instance) then
+                    -- Centre the body inside the part when its thickness can
+                    -- be measured, otherwise step a little past the surface so
+                    -- the pose is never left floating in front of the wall.
+                    local span = ExitDistance(hit.Instance, hit.Position, dir)
+                    local inset = span and math.max(span * 0.5, 0.4) or 1.5
+                    inset = math.min(inset, 8)
+                    hiddenSpot = (hit.Position + dir * inset) - origin
+                    return hiddenSpot
+                end
+            end
+            -- "wall" mode with nothing nearby: still hide under the floor
+            -- instead of leaving the pose out in the open.
+            if mode == "wall" then
+                hiddenSpot = Vector3.new(0, -depth, 0)
+                return hiddenSpot
+            end
+        end
+        -- 2) Straight down under the floor.
+        if mode == "underground" or mode == "auto" then
+            hiddenSpot = Vector3.new(0, -depth, 0)
+            return hiddenSpot
+        end
+        -- 3) Fallback: the old far-away under-map spoof.
+        local angle = math.random() * math.pi * 2
+        hiddenSpot = Vector3.new(math.cos(angle), 0, math.sin(angle))
+            * math.clamp(settings.AntiESPDistance, 5, 500)
+            - Vector3.new(0, depth, 0)
+        return hiddenSpot
     end
 
     -- Omniscient position: a random point on a sphere around the real root.
@@ -5632,18 +6751,28 @@ do
     end
 
     local function calculateOffset(t)
+        -- Anti-ESP takes priority: it parks the pose inside solid geometry, so
+        -- it must NOT stack with the orbit shapes - a square / prism /
+        -- omniscient offset would drag the body back out into the open and
+        -- defeat the whole point.
+        if settings.AntiESP then
+            local character = LocalPlayer.Character
+            local root = character and character:FindFirstChild("HumanoidRootPart")
+            if root then return HiddenOffset(root) end
+        end
+        -- Invisibility: a STATIC hide. Drop the server body straight down
+        -- under the floor at the same XZ - no lateral orbit, no reroll - so
+        -- other clients have no visible pose to draw while our own body and
+        -- camera are restored every frame.
+        if settings.Invisible then
+            return Vector3.new(0, -effectiveDepth(), 0)
+        end
         -- Anti-ESP character spoof: everything other clients see (ESP box,
         -- chams, their aimbot's target position) follows the pose the server
-        -- holds, so displacing it far away and under the map breaks their
-        -- lock. Our own shots are built from this pose too and flow through
-        -- the peek machinery, so we keep hitting them while spoofed.
+        -- holds, so displacing it breaks their lock. Our own shots are built
+        -- from this pose too and flow through the peek machinery, so we keep
+        -- hitting them while spoofed.
         local spoof = Vector3.zero
-        if settings.AntiESP then
-            spoof = AntiESPDirection() * math.clamp(settings.AntiESPDistance, 5, 500)
-            if not settings.Underground then
-                spoof += Vector3.new(0, -math.clamp(settings.UndergroundDepth, 1, 30), 0)
-            end
-        end
         -- Every AA mode now STACKS instead of one overriding the others:
         -- anti-ESP is the far horizontal centre, square and prism both add
         -- their horizontal paths, omniscient adds a random sphere point, the
@@ -5679,7 +6808,7 @@ do
         end
         local lift = math.max(settings.Height or 0, 0)
         if settings.Underground and not settings.Omniscient then
-            lift -= math.clamp(settings.UndergroundDepth, 1, 30)
+            lift -= effectiveDepth()
         end
         return spoof + shape + Vector3.new(0, lift, 0)
     end
@@ -5763,7 +6892,9 @@ do
             end
             return
         end
-        if not settings.Enabled or promptHeld then return end
+        if not settings.Enabled and not settings.AntiESP and not settings.Invisible then return end
+        if promptHeld then return end
+        local hideActive = settings.AntiESP or settings.Invisible
         local t = now()
         if t < pausedUntil or t < forceSyncUntil or t < peekUntil then return end
         local character = LocalPlayer.Character
@@ -5791,12 +6922,12 @@ do
             phase = (phase + math.min(dt, 0.1) * settings.Speed) % 2
         end
         local offset = calculateOffset(phase)
-        -- Safe footing is skipped for anti-esp: the spoof pose is DELIBERATELY
-        -- far away and inside the floor, so wall checks would only zero it
-        -- out (the exact bug that used to kill square / prism indoors).
-        -- Omniscient is skipped for the same reason: it is allowed to go
-        -- below the floor and above the target.
-        if settings.SafeFooting and not settings.Underground and not settings.AntiESP
+        -- Safe footing is skipped for the hide mode: the anti-esp pose is
+        -- DELIBERATELY inside the floor or a wall, so wall checks would
+        -- only zero it out (the exact bug that used to kill square / prism
+        -- indoors). Omniscient is skipped for the same reason: it is allowed to
+        -- go below the floor and above the target.
+        if settings.SafeFooting and not settings.Underground and not hideActive
             and not settings.Omniscient and offset.Magnitude > 0.001 then
             -- The old check shrank this single offset towards zero, so next
             -- to any wall (most of this map) the desync sat at 0 for nearly
@@ -5829,7 +6960,9 @@ do
         -- other players and the ghost see). The offset is now rate limited:
         -- normal path motion passes through untouched, while a teleport-scale
         -- jump is swept over a few frames at up to twice the normal speed.
-        if smoothedOffset and math.max(dt, 0) > 0 then
+        -- Hide modes snap instantly: rate limiting would sweep the pose out of
+        -- the wall / floor it was just parked inside.
+        if not hideActive and smoothedOffset and math.max(dt, 0) > 0 then
             local expectedStep = math.max(dt, 0) * settings.Speed * settings.Range * 8
             local maxDelta = expectedStep * 2 + 0.5
             local delta = offset - smoothedOffset
@@ -5926,10 +7059,23 @@ do
     section:Slider({ Name = "omniscient reroll (s)", Flag = "advanced_aa_omniscient_reroll",
         Min = 0.1, Max = 5, Default = 0.75, Decimals = 0.05,
         Callback = function(value) settings.OmniscientReroll = value end })
-    section:Toggle({ Name = "anti esp (character spoof)", Flag = "advanced_aa_antiesp",
+    section:Toggle({ Name = "anti esp (hide in geometry)", Flag = "advanced_aa_antiesp",
         Default = false,
-        Callback = function(value) settings.AntiESP = value end })
-    section:Slider({ Name = "anti esp distance (studs)", Flag = "advanced_aa_antiesp_dist",
+        Callback = function(value)
+            settings.AntiESP = value
+            hiddenSpot, hiddenSpotAt = nil, 0
+            if not value and not settings.Invisible and not settings.Enabled then
+                restorePose()
+                clearServerPose()
+            end
+        end })
+    section:Dropdown({ Name = "anti esp hide mode", Flag = "advanced_aa_antiesp_mode",
+        Items = { "auto", "underground", "wall", "far" }, Default = "auto",
+        Callback = function(value)
+            settings.AntiESPMode = value
+            hiddenSpot, hiddenSpotAt = nil, 0
+        end })
+    section:Slider({ Name = "anti esp distance (studs, far mode)", Flag = "advanced_aa_antiesp_dist",
         Min = 10, Max = 300, Default = 60, Decimals = 5,
         Callback = function(value) settings.AntiESPDistance = value end })
     section:Slider({ Name = "anti esp reroll (s)", Flag = "advanced_aa_antiesp_reroll",
@@ -5976,6 +7122,14 @@ do
         Min = 1, Max = 25, Default = 20, Decimals = 1,
         Callback = function(value) settings.UndergroundDepth = value end,
     })
+    section:Toggle({ Name = "auto ug depth (deepen on miss)", Flag = "advanced_aa_autodepth",
+        Default = false,
+        Callback = function(value)
+            settings.AutoDepth = value
+            env.AdvancedAAAutoDepth = value
+            autoDepth = value and settings.UndergroundDepth or nil
+            hiddenSpot, hiddenSpotAt = nil, 0
+        end })
     section:Slider({
         Name = "aa speed (cycles/sec)", Flag = "advanced_aa_speed",
         -- High speeds still work as a desync, but the shot origin can no
@@ -5988,6 +7142,7 @@ do
 
     env.AdvancedAACleanup = function()
         settings.Enabled = false
+        settings.AutoDepth = false
         restorePose()
         clearServerPose()
         freezeUntil, frozenRootCF = 0, nil
@@ -6014,6 +7169,9 @@ do
         overrideRoot = nil
         env.AdvancedAAPeek = nil
         env.AdvancedAAIsOrbit = nil
+        env.AdvancedAASetInvisible = nil
+        env.AdvancedAAFeedback = nil
+        env.AdvancedAAAutoDepth = nil
         env.AdvancedAASyncWindow = nil
     end
 end
