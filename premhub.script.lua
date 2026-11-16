@@ -313,6 +313,10 @@
     --#endregion
 
     local CreateTracer;
+    -- Custom view-model shot hook (assigned near the end of the file). The shot
+    -- paths call this so tracers and the muzzle flash come from the view model
+    -- instead of the head. Nil until that region runs.
+    local ViewModelShot;
     local TracerEnabled = false;
     local TracerSpeed = 900;
     local TracerBend = 0.75;
@@ -441,14 +445,23 @@ local TEAM_WHITELIST_ROLES = {
 -- aimbot locks on stays drawn by ESP. Reads the ESP library's live slider
 -- value through getgenv (it publishes itself there), the same bridge the
 -- advanced-aa settings use; the fallback matches the ESP default of 500.
+local targetingRangeAt, targetingRangeValue = 0, 510
 local function TargetingRange()
+    -- The library's distance slider changes rarely, and this is read from the
+    -- aim / ragebot / ESP paths many times per frame, so the resolved value is
+    -- cached briefly instead of walking getgenv() and the settings table each
+    -- call.
+    local t = os.clock()
+    if t - targetingRangeAt < 0.25 then return targetingRangeValue end
     local env = (type(getgenv) == "function" and getgenv()) or _G
     local lib = type(env.EspLib) == "table" and env.EspLib or nil
+    local value = 510
     if lib and type(lib.Table) == "table" then
         local dist = tonumber(lib.Table.Distance)
-        if dist and dist > 0 then return dist + 10 end
+        if dist and dist > 0 then value = dist + 10 end
     end
-    return 510
+    targetingRangeAt, targetingRangeValue = t, value
+    return value
 end
 -- Role from the team name, memoised per Team instance: this runs several times
 -- per player per frame across the aim, ESP and chams code.
@@ -1396,6 +1409,11 @@ do -- combat
             -- fresh instances per bullet and destroy them a second later; at
             -- high fire rates that churn alone costs frames.
             local tracerPartPool, tracerBeamPool = {}, {}
+            -- Reused by the curved path so a tracer no longer builds a fresh
+            -- RaycastParams (and closure) on every shot.
+            local tracerCurveParams = RaycastParams.new()
+            tracerCurveParams.FilterType = Enum.RaycastFilterType.Exclude
+            tracerCurveParams.IgnoreWater = true
             local tracerAttachments = setmetatable({}, { __mode = "k" })
             local TRACER_POOL_LIMIT = 512
 
@@ -1483,8 +1501,7 @@ do -- combat
                 else
                     -- Curved: try to arc around the obstacle that blocks the
                     -- direct line, otherwise fall back to the bend offset.
-                    local params = RaycastParams.new()
-                    params.FilterType = Enum.RaycastFilterType.Exclude
+                    local params = tracerCurveParams
                     params.FilterDescendantsInstances = AAIgnoreList()
                     local function clear(a, b)
                         local delta = b - a
@@ -1747,6 +1764,11 @@ do -- combat
             local lines, tris, shadows = {}, {}, {}
             local angle = 0
             local hue = 0
+            -- Tracks the current FOV drawing mode ("off" / "smooth" / "poly").
+            -- The polygon shape objects are only hidden on a mode transition
+            -- instead of every frame (that was 192 property reads per frame
+            -- for nothing).
+            local fovMode = "off"
 
             local function ensureLines(count)
                 while #lines < count do
@@ -1833,12 +1855,15 @@ do -- combat
                 angle = (angle + math.rad(FovShape.Spin) * step) % (math.pi * 2)
                 hue = (hue + step * FovShape.RainbowSpeed) % 1
                 if not FovCircleEnabled then
-                    if FovCircle.Visible then FovCircle.Visible = false end
-                    if FovFill.Visible then FovFill.Visible = false end
-                    if FovShadow.Visible then FovShadow.Visible = false end
-                    hideLines()
-                    hideTris()
-                    hideShadows()
+                    if fovMode ~= "off" then
+                        fovMode = "off"
+                        FovCircle.Visible = false
+                        FovFill.Visible = false
+                        FovShadow.Visible = false
+                        hideLines()
+                        hideTris()
+                        hideShadows()
+                    end
                     return
                 end
                 local center = UserInputService:GetMouseLocation()
@@ -1862,11 +1887,15 @@ do -- combat
                 FovFill.Visible = smooth and FovShape.Fill
                 FovShadow.Visible = smooth and FovShape.Shadow
                 if smooth then
-                    hideLines()
-                    hideTris()
-                    hideShadows()
+                    if fovMode ~= "smooth" then
+                        fovMode = "smooth"
+                        hideLines()
+                        hideTris()
+                        hideShadows()
+                    end
                     return
                 end
+                fovMode = "poly"
                 FovFill.Visible = false
                 FovShadow.Visible = false
                 local polygons = outline(center, radius, FovShape.Star, angle)
@@ -2128,6 +2157,15 @@ do -- combat
         -- Evaluating from one head and firing from another is what produced
         -- most UG misses (line checked from above ground, bullet sent from
         -- below the floor).
+        -- Hoisted out of the call so the ragebot path does not allocate a new
+        -- comparator closure every frame.
+        local function AimCandidateOrder(a, b)
+            if a.priority ~= b.priority then return a.priority < b.priority end
+            if math.abs(a.alignment - b.alignment) > 0.01 then
+                return a.alignment > b.alignment
+            end
+            return a.dist < b.dist
+        end
         function GetVisibleTarget(Gun, originOverride)
             local LocalCharacter = LocalPlayer.Character
             local LocalHead = LocalCharacter and LocalCharacter:FindFirstChild("Head")
@@ -2175,13 +2213,7 @@ do -- combat
 
             -- Team priority first, then the smallest angle to the crosshair,
             -- then distance - exactly the old ordering, just without the rays.
-            table.sort(candidates, function(a, b)
-                if a.priority ~= b.priority then return a.priority < b.priority end
-                if math.abs(a.alignment - b.alignment) > 0.01 then
-                    return a.alignment > b.alignment
-                end
-                return a.dist < b.dist
-            end)
+            table.sort(candidates, AimCandidateOrder)
 
             local best, bestDist, bestPriority = nil, math.huge, math.huge
             local bestFacing, bestQuality = -math.huge, math.huge
@@ -2245,10 +2277,8 @@ do -- combat
                 end
                 if plan then
                     SilentAimTarget = target
-                    if TracerEnabled then
-                        local tracerOrigin = (typeof(p30) == "Vector3") and p30 or realOrigin
-                        CreateTracer(tracerOrigin, plan.point, plan.offset)
-                    end
+                    -- Tracer / muzzle flash are drawn from the namecall choke
+                    -- point below so every fired shot gets exactly one.
                     return plan.FinalPart, plan.point
                 end
             end
@@ -2419,12 +2449,36 @@ do -- combat
 
                 MarkShots(Args[1])
 
+                if ViewModelShot then
+                    local point, origin
+                    for _, v in ipairs(Args[1]) do
+                        if type(v) == 'table' then
+                            if typeof(v[2]) == "Vector3" then point = v[2] end
+                            if typeof(v[1]) == "Vector3" then origin = v[1] end
+                            break
+                        end
+                    end
+                    ViewModelShot(point, origin)
+                end
+
                 setnamecallmethod(namecallmethod)
 
                 return mtHook(self, table.unpack(Args, 1, select("#", ...)))
             end
             if rawequal(self, Remotes.ShootEvent) and namecallmethod == "FireServer" and type((...)) == 'table' then
-                MarkShots((...))
+                local Shots = (...)
+                MarkShots(Shots)
+                if ViewModelShot then
+                    local point, origin
+                    for _, v in ipairs(Shots) do
+                        if type(v) == 'table' then
+                            if typeof(v[2]) == "Vector3" then point = v[2] end
+                            if typeof(v[1]) == "Vector3" then origin = v[1] end
+                            break
+                        end
+                    end
+                    ViewModelShot(point, origin)
+                end
             end
 
             setnamecallmethod(namecallmethod)
@@ -2527,10 +2581,6 @@ do -- combat
                 end
 
                 LastShot = os.clock()
-
-                if TracerEnabled then
-                    CreateTracer(origin, t.point, t.offset)
-                end
 
                 Remotes.ShootEvent:FireServer(Shots)
                 if state == "server" then FailsafeWatch(targetPlayer) end
@@ -2668,10 +2718,28 @@ do -- combat
         -- penetrable within the budget (the floor between us, a wall to the
         -- side) is a valid peek, not a rejection.
         local function SpotViable(targetPart, spot)
-            local saved = WallPen.Enabled
+            -- EvaluateShot is by far the heaviest probe in the search, and three
+            -- of its extras dominate the cost without changing whether a spot is
+            -- worth peeking from:
+            --   * origin manipulation -> findminoffset walks ManipScanCount
+            --     offsets with two rays each (up to ~240 rays),
+            --   * the hitbox expander -> a raycast per sample,
+            --   * hitscan -> up to HitScanCount surface samples.
+            -- They are switched off for this check only, turning a several
+            -- hundred ray probe into a ~15 ray one (one ray per body part).
+            local savedPen = WallPen.Enabled
+            local savedManip = ManipEnabled
+            local savedHBE = HitboxExpander.Enabled
+            local savedHitscan = HitScanEnabled
             WallPen.Enabled = true
+            ManipEnabled = false
+            HitboxExpander.Enabled = false
+            HitScanEnabled = false
             local ok, plan = pcall(EvaluateShot, targetPart, spot)
-            WallPen.Enabled = saved
+            WallPen.Enabled = savedPen
+            ManipEnabled = savedManip
+            HitboxExpander.Enabled = savedHBE
+            HitScanEnabled = savedHitscan
             return ok and plan ~= nil
         end
 
@@ -2693,33 +2761,44 @@ do -- combat
             -- Every candidate costs several rays / overlap queries. The search
             -- is split across frames and hard-capped so the client keeps
             -- rendering while it looks for a spot instead of stalling for one
-            -- long frame.
+            -- long frame. The most expensive probe (SpotViable -> EvaluateShot)
+            -- also hands the frame back on its own below, so a single candidate
+            -- can never spike a frame.
             local probes = 0
+            local deadline = os.clock() + 0.3
             local function nextProbe()
                 probes += 1
-                if probes % 10 == 0 then task.wait() end
-                return probes > 80
+                if probes % 6 == 0 then task.wait() end
+                -- Two independent caps: a hard probe count and a wall-clock
+                -- budget, so a pathological layout (hundreds of blocked rays)
+                -- cannot stretch a single search past a few frames.
+                return probes > 48 or os.clock() > deadline
             end
 
             -- 1) Below them: progressively deeper until under the slab.
             for _, d in ipairs({ 4, 8, 12 }) do
                 local spot = targetPos - Vector3.new(0, d, 0)
                 if spot.Y > minY and SpotFree(spot, model)
-                    and (underground or SpotSafe(spot, model))
-                    and SpotViable(targetPart, spot) then
-                    return spot
+                    and (underground or SpotSafe(spot, model)) then
+                    local ok = SpotViable(targetPart, spot)
+                    -- The heaviest probe in the search: yield the frame right
+                    -- after it instead of running three of them back to back.
+                    task.wait()
+                    if ok then return spot end
                 end
                 if nextProbe() then return nil end
             end
 
             -- 2) Sides: ring around them, biased to below their head height
             --    (floor level is where cover lives). Only spots their head
-            --    cannot see straight into.
+            --    cannot see straight into. 8 samples over two radii is enough
+            --    to find cover in any real layout; the old 12 x 3 ring tripled
+            --    the probe count for the same result.
             local golden = math.pi * (3 - math.sqrt(5))
-            local count = 12
+            local count = 8
             local viableTries = 0
             local safeCheck = underground and SpotSafeUnderground or SpotSafe
-            for _, radius in ipairs({ 4, 8, 12 }) do
+            for _, radius in ipairs({ 4, 8 }) do
                 for i = 1, count do
                     local y = -0.4 - 1.2 * ((i - 0.5) / count)
                     local radial = math.sqrt(math.max(0, 1 - y * y))
@@ -2730,16 +2809,17 @@ do -- combat
                         and SpotFree(spot - Vector3.new(0, 1.5, 0), model)
                         and safeCheck(spot, model) then
                         viableTries += 1
-                        if SpotViable(targetPart, spot) then
-                            return spot
-                        end
+                        local ok = SpotViable(targetPart, spot)
+                        -- Yield right after the expensive probe (see above).
+                        task.wait()
+                        if ok then return spot end
                         -- Bound the cost: this many viable candidates is
                         -- enough to find cover for any real position.
-                        if viableTries >= 8 then break end
+                        if viableTries >= 4 then break end
                     end
                     if nextProbe() then return nil end
                 end
-                if viableTries >= 8 then break end
+                if viableTries >= 4 then break end
             end
 
             -- 3) Open peek (opt-in last resort): the old clear-line search.
@@ -2848,11 +2928,6 @@ do -- combat
                                 shots[i] = { shotOrigin, plan.point, plan.FinalPart }
                             end
                             lastShot = os.clock()
-                            -- Tracer from your real gun, so on your screen it
-                            -- looks like a normal wallbang.
-                            if TracerEnabled then
-                                CreateTracer(AARealPartPosition(head), plan.point, Vector3.zero)
-                            end
                             MarkShots(shots)
                             Remotes.ShootEvent:FireServer(shots)
                             liveGun:SetAttribute("Local_CurrentAmmo",
@@ -2877,11 +2952,16 @@ do -- combat
         -- Target picker: closest enemy that the normal aim cannot hit.
         -- EvaluateShot is the expensive part of the resolver (rays + wallpen
         -- plan), and the picker used to run it twice for every candidate every
-        -- 0.1s. Each target is now re-evaluated at most every 0.35s, and only
+        -- 0.1s. Each target is now re-evaluated at most every 0.5s, and only
         -- the two best candidates are considered per scan, so an idle resolver
         -- with several players in range costs a fraction of what it did.
         local peekCheckedAt = setmetatable({}, { __mode = "k" })
-        local PEEK_CHECK_INTERVAL = 0.35
+        local PEEK_CHECK_INTERVAL = 0.5
+        -- Hoisted so the resolver scan does not allocate a comparator each tick.
+        local function PeekCandidateOrder(a, b)
+            if a.priority ~= b.priority then return a.priority < b.priority end
+            return a.dist < b.dist
+        end
         task.spawn(function()
             while true do
                 task.wait(0.1)
@@ -2895,6 +2975,10 @@ do -- combat
 
                 local realHead = AARealPartPosition(myHead)
                 local serverHead = AAServerPartPosition(myHead)
+                -- When AA is off (or not displacing) both heads are the same
+                -- point, so the second EvaluateShot would be an identical,
+                -- expensive repeat. Only run it when the poses actually differ.
+                local splitPose = (serverHead - realHead).Magnitude >= 0.05
 
                 -- Silent FOV has priority: while the silent aim has a target
                 -- inside the FOV circle, the resolver only ever peeks FOR
@@ -2916,7 +3000,7 @@ do -- combat
                                 and (not PeekResolver.OnlyUnderground or IsUndergroundCached(fovModel)) then
                                 peekCheckedAt[fovTarget] = now
                                 if not EvaluateShot(fovTarget, realHead)
-                                    and not EvaluateShot(fovTarget, serverHead) then
+                                    and (not splitPose or not EvaluateShot(fovTarget, serverHead)) then
                                     RunPeek(fovTarget)
                                 end
                             end
@@ -2940,10 +3024,7 @@ do -- combat
                         end
                     end
                 end
-                table.sort(candidates, function(a, b)
-                    if a.priority ~= b.priority then return a.priority < b.priority end
-                    return a.dist < b.dist
-                end)
+                table.sort(candidates, PeekCandidateOrder)
 
                 for i = 1, math.min(#candidates, 2) do
                     local c = candidates[i]
@@ -2953,7 +3034,7 @@ do -- combat
                     local underground = IsUndergroundCached(c.model)
                     if (not PeekResolver.OnlyUnderground or underground)
                         and not EvaluateShot(c.head, realHead)
-                        and not EvaluateShot(c.head, serverHead) then
+                        and (not splitPose or not EvaluateShot(c.head, serverHead)) then
                         RunPeek(c.head)
                         break
                     end
@@ -3498,22 +3579,39 @@ do -- combat
 end 
 
 
+-- Scoped so the ESP region's locals do not stay live for the whole main
+-- chunk; the executor compiles with no optimisation and caps active locals.
+do -- esp module
+
 -- Apply shared policy after the external ESP library has positioned its holders.
 -- This now also runs when "team priority" is off but an ESP team whitelist is
 -- set, because the team filter has to work independently of the priority
 -- toggle. Entries are hidden by us (and their library visibility restored
 -- when they become allowed again) instead of being permanently muted.
 local espFilterHidden = setmetatable({}, { __mode = "k" })
+-- The allow/deny decision is policy, not geometry: it only changes when the
+-- user edits the lists / teams change, so it is resolved at ~10Hz per player
+-- instead of every frame. Visibility itself is still applied every frame,
+-- because the library re-shows its holders each frame and a throttled apply
+-- would flicker.
+local espFilterAllowed = setmetatable({}, { __mode = "k" })
+local espFilterCheckedAt = setmetatable({}, { __mode = "k" })
+local ESP_FILTER_INTERVAL = 0.1
 RunService:BindToRenderStep("PriorityESPFilter", Enum.RenderPriority.Camera.Value + 2, function()
     if not EspLib.Cache then return end
     local filterActive = PriorityTeamCheck or next(ESPTeamWhitelist) ~= nil
     if not filterActive then return end
+    local now = os.clock()
     for plr, entry in pairs(EspLib.Cache) do
         -- Team whitelist first (it restricts even name-whitelisted players),
         -- then the normal priority/team policy and the name whitelist.
-        local allowed = TeamWhitelistAllows(ESPTeamWhitelist, plr)
-            and (WhitelistedPlayers[plr.Name] or not PriorityTeamCheck or TargetPriority(plr) ~= nil)
-        if not allowed then
+        local checked = espFilterCheckedAt[plr]
+        if not checked or now - checked >= ESP_FILTER_INTERVAL then
+            espFilterCheckedAt[plr] = now
+            espFilterAllowed[plr] = TeamWhitelistAllows(ESPTeamWhitelist, plr)
+                and (WhitelistedPlayers[plr.Name] or not PriorityTeamCheck or TargetPriority(plr) ~= nil)
+        end
+        if not espFilterAllowed[plr] then
             if espFilterHidden[plr] == nil then espFilterHidden[plr] = entry.Visible end
             if entry.Holder then entry.Holder.Visible = false end
             entry.Visible = false
@@ -3532,6 +3630,12 @@ RunService:BindToRenderStep("PriorityESPFilter", Enum.RenderPriority.Camera.Valu
     for plr in pairs(espFilterHidden) do
         if not EspLib.Cache[plr] then espFilterHidden[plr] = nil end
     end
+    for plr in pairs(espFilterAllowed) do
+        if not EspLib.Cache[plr] then
+            espFilterAllowed[plr] = nil
+            espFilterCheckedAt[plr] = nil
+        end
+    end
 end)
 
 -- ESP presentation. The library scales its box with distance (Factor / depth),
@@ -3546,25 +3650,56 @@ local espHighlight = true
 local espPriorityColor = Color3.fromRGB(255, 200, 60)
 local espBlacklistColor = Color3.fromRGB(255, 70, 70)
 
+-- The two highlight colours are fixed per selection, so their solid sequences
+-- are built once and reused. Without this the render step allocated a fresh
+-- ColorSequence for every highlighted player every frame (pure GC churn).
+local function NewSeqCache() return { color = nil, seq = nil } end
+local espPrioritySeqCache = NewSeqCache()
+local espBlacklistSeqCache = NewSeqCache()
+local function CachedSolidSeq(cache, color)
+    if cache.seq and cache.color == color then return cache.seq end
+    cache.color, cache.seq = color, ColorSequence.new(color)
+    return cache.seq
+end
+
+-- The library's own gradient only changes when the user edits the box / fill
+-- colours, so its built sequences are cached and rebuilt on a key change.
+local espBoxSeqCache = { bot = false, top = false, seq = nil }
+local espFillSeqCache = { bot = false, top = false, seq = nil }
 local function ESPDefaultBoxColor()
     local box = EspLib.Table.Boxes.Box
-    return ColorSequence.new(box.Bot, box.Top)
+    local c = espBoxSeqCache
+    if c.seq and c.bot == box.Bot and c.top == box.Top then return c.seq end
+    c.bot, c.top, c.seq = box.Bot, box.Top, ColorSequence.new(box.Bot, box.Top)
+    return c.seq
 end
 local function ESPDefaultFillColor()
     local fill = EspLib.Table.Boxes.Fill
-    return ColorSequence.new(fill.Bot, fill.Top)
+    local c = espFillSeqCache
+    if c.seq and c.bot == fill.Bot and c.top == fill.Top then return c.seq end
+    c.bot, c.top, c.seq = fill.Bot, fill.Top, ColorSequence.new(fill.Bot, fill.Top)
+    return c.seq
 end
--- nil = leave the library colour alone; otherwise the solid colour to paint.
-local function ESPHighlightColor(plr)
+-- nil = leave the library colour alone; otherwise the solid sequence to paint.
+local function ESPHighlightSeq(plr)
     if not espHighlight or plr == LocalPlayer then return nil end
-    if BlacklistedPlayers[plr.Name] then return espBlacklistColor end
-    if PriorityTeamCheck and TargetPriority(plr) ~= nil then return espPriorityColor end
+    if BlacklistedPlayers[plr.Name] then return CachedSolidSeq(espBlacklistSeqCache, espBlacklistColor) end
+    if PriorityTeamCheck and TargetPriority(plr) ~= nil then return CachedSolidSeq(espPrioritySeqCache, espPriorityColor) end
     return nil
 end
+
+-- Which colour applies is policy (priority / blacklist), so it is decided at
+-- ~10Hz per player and cached on the entry; the cached sequence is re-asserted
+-- every frame only when the live gradient actually differs (the library resets
+-- it on a settings change). This keeps TargetPriority and ColorSequence off
+-- the per-frame path.
+local ESP_RECOLOR_INTERVAL = 0.1
+local espRecolorAt = setmetatable({}, { __mode = "k" })
 
 RunService:BindToRenderStep("ESPOverlay", Enum.RenderPriority.Camera.Value + 3, function()
     local cache = EspLib.Cache
     if not cache then return end
+    local now = os.clock()
     for plr, entry in pairs(cache) do
         if entry.Visible and entry.Holder then
             local h, w = entry.Height, entry.Width
@@ -3576,10 +3711,17 @@ RunService:BindToRenderStep("ESPOverlay", Enum.RenderPriority.Camera.Value + 3, 
                     math.floor(cx - cw * 0.5 + 0.5),
                     math.floor(cy - espSizeCap * 0.5 + 0.5))
             end
-            local color = ESPHighlightColor(plr)
-            if color then
-                entry.BoxGradient.Color = ColorSequence.new(color)
-                entry.FillGradient.Color = ColorSequence.new(color)
+            local checked = espRecolorAt[plr]
+            if not checked or now - checked >= ESP_RECOLOR_INTERVAL then
+                espRecolorAt[plr] = now
+                entry.EspSeq = ESPHighlightSeq(plr)
+            end
+            local seq = entry.EspSeq
+            if seq then
+                if entry.BoxGradient.Color ~= seq then
+                    entry.BoxGradient.Color = seq
+                    entry.FillGradient.Color = seq
+                end
                 entry.EspRecolored = true
             elseif entry.EspRecolored then
                 entry.BoxGradient.Color = ESPDefaultBoxColor()
@@ -3587,6 +3729,10 @@ RunService:BindToRenderStep("ESPOverlay", Enum.RenderPriority.Camera.Value + 3, 
                 entry.EspRecolored = false
             end
         end
+    end
+    -- Drop saved timers for players the library no longer tracks.
+    for plr in pairs(espRecolorAt) do
+        if not cache[plr] then espRecolorAt[plr] = nil end
     end
 end)
 
@@ -3791,12 +3937,14 @@ do -- esp
         Callback = function(v) espBlacklistColor = v end
     })
 end
+end -- esp module
 
 
 -- ==========================================
 -- LATENCY GHOST | VISUALS TAB
 -- ==========================================
 
+do -- ghost module (scoped: frees main-chunk locals)
 local GhostEnabled = false
 local GhostColor = Color3.fromRGB(120, 190, 255)
 
@@ -3865,6 +4013,17 @@ local function GhostDestroy()
     GhostHighlight = nil
 end
 
+-- The ghost is a client-only, purely visual shell. A dedicated collision group
+-- (when the executor is allowed to register one) keeps it out of every collision
+-- pair so it can never block the player or a vehicle.
+local GhostCollisionGroup
+pcall(function()
+    local PhysicsService = game:GetService("PhysicsService")
+    PhysicsService:RegisterCollisionGroup("NegrohaxGhost")
+    PhysicsService:CollisionGroupSetCollidable("NegrohaxGhost", "Default", false)
+    GhostCollisionGroup = "NegrohaxGhost"
+end)
+
 local function GhostCreate(character)
     GhostDestroy()
 
@@ -3893,34 +4052,34 @@ local function GhostCreate(character)
         if object:IsA("Script") or object:IsA("LocalScript") then
             object:Destroy()
 
+        elseif object:IsA("JointInstance") or object:IsA("WeldConstraint") then
+            -- Drop every joint so the clone can never be welded to something
+            -- outside itself (a vehicle seat, for example). The parts keep their
+            -- cloned pose and PivotTo moves them as a rigid group.
+            object:Destroy()
+
         elseif object:IsA("BasePart") then
             object.Anchored = true
             object.CanCollide = false
             object.CanTouch = false
             object.CanQuery = false
+            object.Massless = true
+            if GhostCollisionGroup then
+                pcall(function() object.CollisionGroup = GhostCollisionGroup end)
+            end
 
-            -- If the character was cloned while invisibility had painted it,
-            -- the parts came over at Transparency = 1. Use the transparency the
-            -- invisibility block stashed on the part so the ghost stays visible
-            -- and keeps tracking even while you are invisible.
-            local original = object:GetAttribute("InvisibleOriginalTransparency")
-            if original == nil then original = object.Transparency end
-
-            object:SetAttribute("GhostOriginalTransparency", original)
-
-        elseif object:IsA("Decal") or object:IsA("Texture") then
-            -- Same idea for faces / textures: invisibility painted them too,
-            -- so pull the stashed value back so the ghost's face still shows.
-            local original = object:GetAttribute("InvisibleOriginalTransparency")
-            if original ~= nil then object.Transparency = original end
+            -- Remember the transparency the part had when cloned, so a locally
+            -- faded character (damage flash, chams) still yields a solid ghost.
+            object:SetAttribute("GhostOriginalTransparency", object.Transparency)
         end
     end
 
+    -- Strip the Humanoid: without it the ghost is pure geometry, so the game's
+    -- seats and physics cannot seat, weld or otherwise interact with it. This is
+    -- what used to let a vehicle seat latch onto the ghost and stop the car dead.
     local humanoid = clone:FindFirstChildOfClass("Humanoid")
-
     if humanoid then
-        humanoid.DisplayDistanceType =
-            Enum.HumanoidDisplayDistanceType.None
+        humanoid:Destroy()
     end
 
     GhostHighlight = Instance.new("Highlight")
@@ -4055,16 +4214,24 @@ local function GhostGetHistoricalCFrame(targetTime)
     return GhostHistory[#GhostHistory].CFrame
 end
 
+local ghostPingSampleAt = 0
 local function GhostGetPing()
-    local success, ping = pcall(function()
-        return LocalPlayer:GetNetworkPing()
-    end)
+    -- Only the smoothed average is used downstream, and the ping itself moves
+    -- slowly, so the pcall + GetNetworkPing is sampled a few times a second
+    -- instead of on every render frame.
+    local t = os.clock()
+    if t - ghostPingSampleAt >= 0.25 then
+        ghostPingSampleAt = t
+        local success, ping = pcall(function()
+            return LocalPlayer:GetNetworkPing()
+        end)
 
-    if success and type(ping) == "number" then
-        GhostAveragePing =
-            GhostAveragePing == 0
-            and ping
-            or GhostAveragePing + (ping - GhostAveragePing) * 0.12
+        if success and type(ping) == "number" then
+            GhostAveragePing =
+                GhostAveragePing == 0
+                and ping
+                or GhostAveragePing + (ping - GhostAveragePing) * 0.12
+        end
     end
 
     return math.clamp(
@@ -4230,6 +4397,7 @@ Sections.visuals:Label({
         GhostSetColor(value)
     end
 })
+end -- ghost module
 
 
 do -- visuals
@@ -4247,6 +4415,7 @@ do -- visuals
 -- VISUALS TAB
 -- ==========================================
 
+do -- advanced team check (scoped: frees main-chunk locals)
 local AdvancedTeamCheck = {
     Enabled = true,
     IgnoreSameTeam = true,
@@ -4337,6 +4506,7 @@ Sections.visuals:Toggle({
         AdvancedTeamCheck.IgnoreDead = value
     end
 })
+end -- advanced team check
 
 
 -- ==========================================
@@ -4344,6 +4514,7 @@ Sections.visuals:Toggle({
 -- VISUALS TAB
 -- ==========================================
 
+do -- movement resolver (scoped: frees main-chunk locals)
 local ResolverEnabled = false
 
 local ResolverPlayers = {}
@@ -4757,6 +4928,7 @@ Sections.visuals:Toggle({
         ResolverPanel.Visible = value
     end
 })
+end -- movement resolver
     
 
     
@@ -4868,6 +5040,7 @@ Sections.visuals:Toggle({
 
 
 -- Equipped-tool chams. Controls live on the visuals tab.
+do -- tool chams module (scoped: frees main-chunk locals)
 local ToolChams = {
     Enabled = false,
     Glow = true,
@@ -5237,6 +5410,7 @@ Sections.visuals:Slider({
         ToolChams.RainbowSpeed = value
     end
 })
+end -- tool chams module
 
 
     --#region toggles
@@ -5460,6 +5634,48 @@ Sections.visuals:Toggle({
             end 
         })
 
+        --#region time changer
+
+            -- Locks the client clock so you can force day or night. Re-asserted every
+            -- frame because the game's own day / night cycle keeps writing ClockTime
+            -- from the server. Purely local: Lighting changes never replicate.
+            do
+                local TimeChangerEnabled = false
+                local TimeChangerValue = 12
+
+                RunService.RenderStepped:Connect(function()
+                    if not TimeChangerEnabled then return end
+                    if Lighting.ClockTime ~= TimeChangerValue then
+                        Lighting.ClockTime = TimeChangerValue
+                    end
+                end)
+
+                Sections.visuals:Toggle({
+                    Name = 'time changer';
+                    Flag = 'timechanger';
+                    Default = false;
+                    Callback = function(v)
+                        TimeChangerEnabled = v;
+                        if v then Lighting.ClockTime = TimeChangerValue end;
+                    end
+                })
+
+                Sections.visuals:Slider({
+                    Name = 'time of day';
+                    Flag = 'timeofday';
+                    Min = 0;
+                    Max = 24;
+                    Default = 12;
+                    Decimals = 1;
+                    Callback = function(v)
+                        TimeChangerValue = v;
+                        if TimeChangerEnabled then Lighting.ClockTime = v end;
+                    end
+                })
+            end
+
+        --#endregion
+
         Sections.visuals:Toggle({ 
             Name = 'bullet tracers';
             Flag = 'tracers';
@@ -5665,175 +5881,79 @@ local _InfiniteJumpConnection =
 
 --#endregion
 
+--#region restore hitboxes
 
---#region invisibility
-
-    -- Invisibility: hides your real SERVER body. Every part, accessory, decal
-    -- and equipped tool on the character is made fully transparent locally (so
-    -- nothing of you renders on your own screen), AND the server pose is parked
-    -- straight down under the floor by the advanced-aa engine - the same hide
-    -- mechanism anti-ESP uses, but static (no lateral orbit, no reroll). Other
-    -- clients therefore never receive a visible pose to draw an ESP box / chams
-    -- from. Your own body and camera are restored every frame, so you stay
-    -- where the game put you and interaction keeps working (the engine pauses
-    -- the hide on E / ClickDetectors / proximity prompts).
+    -- Counter to other players running a "no hitbox" script: force CanQuery / CanTouch
+    -- back on for every other player's character parts on OUR client, so our aim rays
+    -- and touch tests always see them. Purely local, and a no-op when the flags were
+    -- never cleared. Also fixes the case where a game marks its own body parts or
+    -- accessories non-queriable, which would otherwise make them unhittable to us.
     do
-        local Invisible = {
+        local RestoreHitboxes = {
             Enabled = false,
-            Saved = WeakKeyedTable(),
-            Connections = {},
-            Character = nil,
-            LastSweep = 0,
+            Originals = WeakKeyedTable(),
         }
 
-        -- The original transparency is also mirrored onto the part as an
-        -- attribute, so the latency-ghost clone (which is cloned FROM this
-        -- character) can tell what each part looked like before invisibility
-        -- painted it and keep the ghost visible instead of inheriting the
-        -- fully-transparent values.
-        local function Save(object)
-            if Invisible.Saved[object] then return end
-            if object:IsA("BasePart") then
-                Invisible.Saved[object] = { Kind = "part", Value = object.Transparency }
-                pcall(function()
-                    object:SetAttribute("InvisibleOriginalTransparency", object.Transparency)
-                end)
-            elseif object:IsA("Decal") or object:IsA("Texture") then
-                Invisible.Saved[object] = { Kind = "decal", Value = object.Transparency }
-                pcall(function()
-                    object:SetAttribute("InvisibleOriginalTransparency", object.Transparency)
-                end)
+        local function restore(part)
+            if not part:IsA("BasePart") then return end
+            if part.CanQuery and part.CanTouch then return end
+            if RestoreHitboxes.Originals[part] == nil then
+                RestoreHitboxes.Originals[part] = {
+                    CanQuery = part.CanQuery,
+                    CanTouch = part.CanTouch,
+                }
+            end
+            part.CanQuery = true
+            part.CanTouch = true
+        end
+
+        local function sweep(character)
+            for _, part in ipairs(character:GetDescendants()) do
+                restore(part)
             end
         end
 
-        local function Paint(object)
-            if object:IsA("BasePart") or object:IsA("Decal") or object:IsA("Texture") then
-                Save(object)
-                if object.Transparency ~= 1 then object.Transparency = 1 end
-            end
-        end
-
-        local function Restore()
-            for object, saved in pairs(Invisible.Saved) do
-                if object.Parent then
-                    pcall(function() object.Transparency = saved.Value end)
-                    pcall(function() object:SetAttribute("InvisibleOriginalTransparency", nil) end)
+        local function sweepAll()
+            for _, plr in ipairs(Players:GetPlayers()) do
+                if plr ~= LocalPlayer then
+                    local character = plr.Character
+                    if character then sweep(character) end
                 end
             end
-            table.clear(Invisible.Saved)
         end
 
-        local function Sweep()
-            local character = Invisible.Character
-            if not character or not character.Parent then return end
-            for _, object in ipairs(character:GetDescendants()) do
-                Paint(object)
-            end
-            local humanoid = character:FindFirstChildOfClass("Humanoid")
-            if humanoid then
-                humanoid.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
-                humanoid.HealthDisplayType = Enum.HumanoidHealthDisplayType.AlwaysOff
-            end
-        end
-
-        local function Disconnect()
-            for _, connection in ipairs(Invisible.Connections) do
-                pcall(function() connection:Disconnect() end)
-            end
-            table.clear(Invisible.Connections)
-        end
-
-        local function BindTool(tool)
-            if not tool:IsA("Tool") then return end
-            for _, object in ipairs(tool:GetDescendants()) do
-                Paint(object)
-            end
-        end
-
-        local function Watch(character)
-            Disconnect()
-            Restore()
-            Invisible.Character = character
-            if not character or not Invisible.Enabled then return end
-            Sweep()
-            task.spawn(function()
-                -- A respawned rig exists before the game finishes setting it
-                -- up, so re-sweep twice over the next second.
-                for _ = 1, 2 do
-                    task.wait(0.45)
-                    if not Invisible.Enabled or Invisible.Character ~= character then return end
-                    Sweep()
+        local function revertAll()
+            for part, original in pairs(RestoreHitboxes.Originals) do
+                if part.Parent then
+                    part.CanQuery = original.CanQuery
+                    part.CanTouch = original.CanTouch
                 end
-            end)
-            table.insert(Invisible.Connections, character.DescendantAdded:Connect(function(object)
-                if not Invisible.Enabled then return end
-                task.defer(function()
-                    if Invisible.Enabled then Paint(object) end
-                end)
-            end))
-            table.insert(Invisible.Connections, character.ChildAdded:Connect(function(object)
-                if not (Invisible.Enabled and object:IsA("Tool")) then return end
-                BindTool(object)
-            end))
-            for _, child in ipairs(character:GetChildren()) do
-                if child:IsA("Tool") then BindTool(child) end
+                RestoreHitboxes.Originals[part] = nil
             end
         end
 
-        local function SetEnabled(value)
-            Invisible.Enabled = value
-            -- Drive the static server-body hide in the advanced-aa engine.
-            local bridge = (type(getgenv) == "function" and getgenv()) or _G
-            if type(bridge.AdvancedAASetInvisible) == "function" then
-                pcall(bridge.AdvancedAASetInvisible, value)
-            end
-            if value then
-                Watch(LocalPlayer.Character)
-            else
-                Restore()
-                Disconnect()
-                Invisible.Character = nil
-            end
-        end
-
-        LocalPlayer.CharacterAdded:Connect(function(character)
-            if not Invisible.Enabled then return end
-            task.defer(function()
-                if Invisible.Enabled then Watch(character) end
-            end)
+        -- A slow catch-all sweep: the flags only change when a player toggles their
+        -- own script, so there is no reason to touch every part every frame.
+        local sweepClock = 0
+        RunService.Heartbeat:Connect(function(dt)
+            if not RestoreHitboxes.Enabled then return end
+            sweepClock += dt
+            if sweepClock < 0.5 then return end
+            sweepClock = 0
+            sweepAll()
         end)
 
-        -- Damage flashes, respawns and tool equips can rewrite Transparency.
-        -- The sweep only touches values that actually changed.
-        RunService.Heartbeat:Connect(function()
-            if not Invisible.Enabled then return end
-            local now = os.clock()
-            if now - Invisible.LastSweep < 0.1 then return end
-            Invisible.LastSweep = now
-            local character = LocalPlayer.Character
-            if not character then return end
-            if character ~= Invisible.Character then
-                Watch(character)
-                return
-            end
-            for _, object in ipairs(character:GetDescendants()) do
-                if (object:IsA("BasePart") or object:IsA("Decal") or object:IsA("Texture"))
-                    and object.Transparency ~= 1 then
-                    Paint(object)
-                end
-            end
-        end)
-
-        -- Hides your real server body (static hide under the floor) and makes
-        -- you transparent locally. Stays on until you switch it off; there is
-        -- no interaction timer because the engine already pauses the hide when
-        -- you use E / ClickDetectors / prompts.
         Sections.exploits:Toggle({
-            Name = "invisibility (hide server body)";
-            Flag = "invisibility";
+            Name = "restore hitboxes";
+            Flag = "restorehitboxes";
             Default = false;
             Callback = function(value)
-                SetEnabled(value);
+                RestoreHitboxes.Enabled = value;
+                if value then
+                    sweepAll();
+                else
+                    revertAll();
+                end
             end;
         })
     end
@@ -6098,6 +6218,353 @@ Sections.movement:Toggle({
         InfiniteJumpEnabled = v;
     end
 })
+
+    --#region car fly
+
+        -- Flies the vehicle you are sitting in. A BodyVelocity on the chassis root
+        -- takes over the car's motion (WASD strafes on the XZ plane, Q down / E up)
+        -- and a BodyGyro keeps it level. Only runs while you are seated, so it does
+        -- nothing on foot and cleans itself up when you get out.
+        do
+            local CarFly = {
+                Enabled = false,
+                Speed = 70,
+                -- Camera orbit distance. Small = first person (camera sits on the
+                -- car), large = third person. The scroll wheel zooms it live and
+                -- the "car fly distance" slider sets it, so you can fly in either
+                -- view without leaving the shift-lock style camera.
+                Distance = 16,
+                MinDistance = 0.5,
+                MaxDistance = 30,
+                Height = 3,
+                -- Radians of view turn per pixel of mouse movement. The old 0.25
+                -- meant a 3-4px flick snapped the view ~48 degrees, which read as
+                -- both "way too sensitive" and "it only turns a little".
+                Sensitivity = 0.012,
+                -- How fast the view / the car ease toward their targets. Higher is
+                -- snappier; these are what make the turn smooth rather than instant.
+                ViewSmoothing = 18,
+                TurnSmoothing = 10,
+                -- Optional spin: an extra yaw offset layered on top of the car's
+                -- heading, so the car twirls in place. The camera only ever reads
+                -- camYaw (never the car's rotation), so the car can spin freely
+                -- while your view stays steady. Speed is degrees per second.
+                Spin = false,
+                SpinSpeed = 360,
+            }
+
+            local bodyVel
+            local bodyGyro
+            local vehicleRoot
+            local vehicleSeat
+
+            -- Shift-lock style camera. While flying, the camera is scriptable and
+            -- orbits the car, driven only by the mouse, so the car's own rotation
+            -- (the BodyGyro) can never feed back into the view and make it spin.
+            -- The mouse only moves a *target* yaw / pitch; the live values ease
+            -- toward it so a fast flick glides instead of snapping.
+            local camYaw, camPitch = 0, -0.2
+            local camYawTarget, camPitchTarget = 0, -0.2
+            -- The car's own heading eases toward the view yaw for the same reason.
+            local carYaw = 0
+            -- Extra yaw applied on top of carYaw by the spin feature.
+            local spinAngle = 0
+            local savedCameraType
+            local cameraActive = false
+
+            local CAMERA_STEP = "NegrohaxCarFlyCamera"
+
+            local function restoreCamera()
+                local camera = workspace.CurrentCamera
+                if camera and camera.CameraType == Enum.CameraType.Scriptable then
+                    camera.CameraType = savedCameraType or Enum.CameraType.Custom
+                end
+                -- Never leave the mouse locked to the centre once flight ends.
+                -- The saved value can itself be LockCenter (captured while the
+                -- game had the mouse locked in the seat), which is exactly what
+                -- left the screen stuck after stepping out of the car.
+                if UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter then
+                    UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+                end
+                savedCameraType = nil
+                cameraActive = false
+            end
+
+            local function stopCarFly()
+                if bodyVel then
+                    bodyVel:Destroy()
+                    bodyVel = nil
+                end
+                if bodyGyro then
+                    bodyGyro:Destroy()
+                    bodyGyro = nil
+                end
+                vehicleRoot = nil
+                vehicleSeat = nil
+                spinAngle = 0
+                restoreCamera()
+            end
+
+            local function seatedSeat()
+                local character = LocalPlayer.Character
+                local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+                return humanoid and humanoid.SeatPart
+            end
+
+            local function seatedRoot(seat)
+                if not seat then return nil end
+                return seat.AssemblyRootPart or seat
+            end
+
+            -- Live world position of the car. The seat is welded to the chassis, so
+            -- it always tracks the car; the character root (welded to the seat) is
+            -- only a fallback for the odd frame where the seat is not streamed yet.
+            local function carPosition()
+                if vehicleSeat and vehicleSeat.Parent then return vehicleSeat.Position end
+                if vehicleRoot and vehicleRoot.Parent then return vehicleRoot.Position end
+                local character = LocalPlayer.Character
+                local hrp = character and character:FindFirstChild("HumanoidRootPart")
+                return hrp and hrp.Position
+            end
+
+            -- Scriptable, shift-lock style camera. The mouse drives yaw / pitch
+            -- directly and the camera orbits the car, so nothing the car does can
+            -- feed back into the view. The whole rig lives in the render step so it
+            -- cannot get stuck: it re-checks the seat and re-asserts the camera type
+            -- every frame, and hands the camera back the moment you stop.
+            local function updateCarFlyCamera(dt)
+                local cam = workspace.CurrentCamera
+                if not cam then return end
+
+                local seat = CarFly.Enabled and seatedSeat() or nil
+                if not seat then
+                    if cameraActive then restoreCamera() end
+                    return
+                end
+
+                if not cameraActive then
+                    cameraActive = true
+                    savedCameraType = cam.CameraType
+
+                    -- Seed yaw / pitch from wherever the player is already looking.
+                    local look = cam.CFrame.LookVector
+                    camYaw = math.atan2(-look.X, -look.Z)
+                    camPitch = math.asin(math.clamp(look.Y, -1, 1))
+                    camYawTarget, camPitchTarget = camYaw, camPitch
+                end
+
+                -- The default camera module (and the game) can reset these out from
+                -- under us, so re-assert them every frame.
+                if cam.CameraType ~= Enum.CameraType.Scriptable then
+                    cam.CameraType = Enum.CameraType.Scriptable
+                end
+                if UserInputService.MouseBehavior ~= Enum.MouseBehavior.LockCenter then
+                    UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+                end
+
+                local position = carPosition()
+                if not position then return end
+
+                -- GetMouseDelta returns a Vector2. Destructuring it into two locals
+                -- gave (Vector2, nil), so the very next line threw every frame and
+                -- left the camera frozen at whatever CFrame it had when the step was
+                -- first bound.
+                local delta = UserInputService:GetMouseDelta()
+                camYawTarget -= delta.X * CarFly.Sensitivity
+                camPitchTarget = math.clamp(camPitchTarget - delta.Y * CarFly.Sensitivity, -1.1, 1.1)
+
+                -- Frame-rate independent easing: the view glides toward the mouse
+                -- target instead of jumping to it, which is what makes turning feel
+                -- smooth rather than twitchy.
+                local step = dt or 0.016
+                local ease = 1 - math.exp(-CarFly.ViewSmoothing * step)
+                camYaw += (camYawTarget - camYaw) * ease
+                camPitch += (camPitchTarget - camPitch) * ease
+
+                local rot = CFrame.fromEulerAnglesYXZ(camPitch, camYaw, 0)
+                local target = position + Vector3.new(0, CarFly.Height, 0)
+                -- Clamp so a first-person setting (0) never degenerates into a
+                -- zero-length lookAt.
+                local distance = math.clamp(
+                    CarFly.Distance or 16, CarFly.MinDistance, CarFly.MaxDistance)
+                cam.CFrame = CFrame.lookAt(target - rot.LookVector * distance, target)
+            end
+
+            -- Bound once for the whole session. Binding inside the toggle (and
+            -- unbinding on stop) collided with the script's own stale binding when
+            -- it was re-executed: BindToRenderStep throws if the name is already
+            -- taken, which silently left the camera frozen where it was enabled.
+            pcall(function()
+                RunService:UnbindFromRenderStep(CAMERA_STEP)
+            end)
+            RunService:BindToRenderStep(CAMERA_STEP, Enum.RenderPriority.Camera.Value + 1, updateCarFlyCamera)
+
+            -- Scroll wheel zooms the orbit while flying: pull in for a first-person
+            -- view, push out for third person. It only runs while the flight camera
+            -- is actually active, so it never swallows the scroll wheel on foot.
+            local carFlyDistanceSlider
+            UserInputService.InputChanged:Connect(function(input)
+                if not cameraActive then return end
+                if input.UserInputType ~= Enum.UserInputType.MouseWheel then return end
+                local distance = (CarFly.Distance or 16) - input.Position.Z * 2
+                distance = math.clamp(distance, CarFly.MinDistance, CarFly.MaxDistance)
+                CarFly.Distance = distance
+                if carFlyDistanceSlider then carFlyDistanceSlider:Set(distance) end
+            end)
+
+            RunService.Heartbeat:Connect(function(dt)
+                if not CarFly.Enabled then
+                    if bodyVel then stopCarFly() end
+                    return
+                end
+
+                local seat = seatedSeat()
+                local root = seatedRoot(seat)
+                if not root then
+                    if bodyVel then stopCarFly() end
+                    return
+                end
+
+                vehicleSeat = seat
+
+                if root ~= vehicleRoot or not bodyVel or not bodyVel.Parent then
+                    if bodyVel then bodyVel:Destroy() end
+                    if bodyGyro then bodyGyro:Destroy() end
+                    vehicleRoot = root
+
+                    -- Start the car's heading exactly where the view is so it does
+                    -- not swing round to catch up on the first frame.
+                    carYaw = camYaw
+
+                    bodyVel = Instance.new("BodyVelocity")
+                    bodyVel.Name = "NegrohaxCarFly"
+                    bodyVel.MaxForce = Vector3.new(1e6, 1e6, 1e6)
+                    bodyVel.P = 1250
+                    bodyVel.Parent = root
+
+                    bodyGyro = Instance.new("BodyGyro")
+                    bodyGyro.Name = "NegrohaxCarFlyGyro"
+                    bodyGyro.MaxTorque = Vector3.new(1e6, 1e6, 1e6)
+                    bodyGyro.P = 3000
+                    bodyGyro.D = 200
+                    bodyGyro.Parent = root
+                end
+
+                -- WASD moves on the horizontal plane only: derive forward / right
+                -- from the camera yaw so pitch never lifts the car, then flatten.
+                local forward = Vector3.new(-math.sin(camYaw), 0, -math.cos(camYaw))
+                local strafe = Vector3.new(-forward.Z, 0, forward.X)
+
+                local direction = Vector3.zero
+                if UserInputService:IsKeyDown(Enum.KeyCode.W) then direction += forward end
+                if UserInputService:IsKeyDown(Enum.KeyCode.S) then direction -= forward end
+                if UserInputService:IsKeyDown(Enum.KeyCode.D) then direction += strafe end
+                if UserInputService:IsKeyDown(Enum.KeyCode.A) then direction -= strafe end
+                if direction.Magnitude > 0 then direction = direction.Unit end
+
+                local vertical = 0
+                if UserInputService:IsKeyDown(Enum.KeyCode.E) then vertical += 1 end
+                if UserInputService:IsKeyDown(Enum.KeyCode.Q) then vertical -= 1 end
+
+                bodyVel.Velocity =
+                    direction * CarFly.Speed + Vector3.new(0, vertical * CarFly.Speed, 0)
+
+                -- Keep the car level and eases its heading toward the view so a hard
+                -- turn banks round smoothly instead of snapping. The camera never
+                -- reads the car's rotation, so this can never feed back into the view.
+                local ease = 1 - math.exp(-CarFly.TurnSmoothing * (dt or 0.016))
+                carYaw += (camYaw - carYaw) * ease
+
+                -- Spin: a separate yaw offset added on top of the heading. While the
+                -- toggle is off the offset eases back to zero so the car settles
+                -- level instead of freezing mid-twirl. Normalising to [-pi, pi]
+                -- keeps the value small (no precision drift on a long flight) and
+                -- makes the settle take the short way round.
+                if CarFly.Spin then
+                    spinAngle += math.rad(CarFly.SpinSpeed) * (dt or 0.016)
+                else
+                    spinAngle += (0 - spinAngle) * ease
+                end
+                spinAngle = (spinAngle + math.pi) % (2 * math.pi) - math.pi
+
+                bodyGyro.CFrame = CFrame.Angles(0, carYaw + spinAngle, 0)
+            end)
+
+            Sections.movement:Toggle({
+                Name = 'car fly';
+                Flag = 'carfly';
+                Default = false;
+                Callback = function(v)
+                    CarFly.Enabled = v
+                    if not v then stopCarFly() end
+                end
+            })
+
+            Sections.movement:Slider({
+                Name = 'car fly speed';
+                Flag = 'carflyspeed';
+                Min = 10;
+                Max = 400;
+                Default = 70;
+                Decimals = 1;
+                Callback = function(v)
+                    CarFly.Speed = v
+                end
+            })
+
+            Sections.movement:Slider({
+                Name = 'car fly turn speed';
+                Flag = 'carflyturnspeed';
+                Min = 0.002;
+                Max = 0.08;
+                Default = 0.012;
+                -- NOTE: in this library Decimals is the *step size*, not a digit
+                -- count. Passing 3 made the step 3, so every value rounded to 0 and
+                -- the slider looked stuck.
+                Decimals = 0.001;
+                Callback = function(v)
+                    CarFly.Sensitivity = v
+                end
+            })
+
+            carFlyDistanceSlider = Sections.movement:Slider({
+                Name = 'car fly distance';
+                Flag = 'carflydistance';
+                Min = 0;
+                Max = 30;
+                Default = 16;
+                -- Same library quirk as above: Decimals is the step size. 0.5 gives
+                -- a smooth half-metre zoom; 0 or a digit count would break it.
+                Decimals = 0.5;
+                Callback = function(v)
+                    CarFly.Distance = v
+                end
+            })
+
+            Sections.movement:Toggle({
+                Name = 'car spin';
+                Flag = 'carspin';
+                Default = false;
+                Callback = function(v)
+                    CarFly.Spin = v
+                end
+            })
+
+            Sections.movement:Slider({
+                Name = 'car spin speed';
+                Flag = 'carspinspeed';
+                Min = 30;
+                Max = 1440;
+                Default = 360;
+                -- Degrees per second; 10 is a fine enough step to feel smooth.
+                Decimals = 10;
+                Callback = function(v)
+                    CarFly.SpinSpeed = v
+                end
+            })
+        end
+
+    --#endregion
         
         local SoundNames = {}
 
@@ -6217,13 +6684,6 @@ end
 --     we keep hitting them while they cannot hit us. Square / prism can be
 --     combined with it and then orbit around the spoofed centre.
 --
--- Invisibility ("invisibility" toggle in the exploits section):
---   * The same hide mechanism as anti-ESP, but STATIC: the server body is
---     dropped straight under the floor at its own XZ and left there - no
---     lateral orbit and no reroll - so other clients never receive a visible
---     pose to draw an ESP box / chams from. Your own body and camera are
---     restored every frame, so you do not see the movement.
---
 -- Position-based shapes (square / prism):
 --   * Square walks the server position around a square loop in the XZ
 --     plane (range = size, speed = how fast it orbits), clockwise.
@@ -6318,13 +6778,6 @@ do
         AntiESPMode = "auto",
         AntiESPDistance = 60,
         AntiESPReroll = 3,
-        -- Invisibility: driven by the "invisibility" toggle in the exploits
-        -- section. It parks the server body STRAIGHT DOWN under the floor at
-        -- the same XZ - the same hide mechanism as anti-ESP, but static (no
-        -- lateral orbit, no reroll) - so other clients never receive a visible
-        -- pose to draw an ESP box / chams from. The client body and camera are
-        -- restored every frame, so you do not see the movement.
-        Invisible = false,
         -- Omniscient: random sphere around the real root, in X/Y/Z. Radius is
         -- capped by the range slider, and the point is re-rolled on its own
         -- timer. Cancels UG (it already goes above and below ground).
@@ -6427,10 +6880,18 @@ do
         return math.clamp(autoDepth or settings.UndergroundDepth, 1, 30)
     end
 
+    -- GetNetworkPing + pcall is not free and this is asked for on every
+    -- ragebot tick and on every shot, while ping itself moves slowly: sample it
+    -- a few times a second and reuse the value in between.
+    local syncWindowAt, syncWindowValue = 0, 0.1
     local function syncWindow()
+        local t = os.clock()
+        if t - syncWindowAt < 0.1 then return syncWindowValue end
         local ok, ping = pcall(function() return LocalPlayer:GetNetworkPing() end)
         ping = (ok and tonumber(ping)) or 0.1
-        return math.clamp(ping + 0.05, 0.08, 0.45)
+        syncWindowValue = math.clamp(ping + 0.05, 0.08, 0.45)
+        syncWindowAt = t
+        return syncWindowValue
     end
 
     -- Put the exact real pose back. Never skipped.
@@ -6492,12 +6953,12 @@ do
     end
     env.AdvancedAAPeek = function(seconds)
         if not settings.ShotPeek then return false end
-        if not (settings.Enabled or settings.AntiESP or settings.Invisible) then return false end
+        if not (settings.Enabled or settings.AntiESP) then return false end
         -- Square / prism must keep orbiting to stay useful, so a peek there
         -- only holds the real pose for one shot window (~latency + a frame)
-        -- instead of the long UG cap. UG / anti-ESP / invisibility poses are
-        -- deliberately unshootable, so those keep the full cap.
-        local cap = (settings.Underground or settings.AntiESP or settings.Invisible) and PEEK_MAX or 0.3
+        -- instead of the long UG cap. UG / anti-ESP poses are deliberately
+        -- unshootable, so those keep the full cap.
+        local cap = (settings.Underground or settings.AntiESP) and PEEK_MAX or 0.3
         local t = now()
         if t < peekUntil then
             -- Already peeking: extend, but never past the cap.
@@ -6540,16 +7001,6 @@ do
 
     env.AdvancedAAPause = pauseAA
     env.AdvancedAAForceSync = forceSync
-    -- Invisibility bridge: the "invisibility" switch in the exploits section
-    -- parks the server body under the floor (static hide). Turning it off only
-    -- drops the pose when nothing else still needs it (anti-ESP / the AA).
-    env.AdvancedAASetInvisible = function(enabled)
-        settings.Invisible = enabled == true
-        if not settings.Invisible and not settings.AntiESP and not settings.Enabled then
-            restorePose()
-            clearServerPose()
-        end
-    end
     -- Auto UG depth: the combat shot watcher reports every shot outcome while
     -- a displaced pose is active. A miss deepens the pose one step (capped),
     -- so it settles past the depth where the under-shots start landing.
@@ -6563,19 +7014,17 @@ do
     -- failsafe off (see AAAutoDepthOn).
     env.AdvancedAAAutoDepth = false
     env.AdvancedAAStatus = function()
-        return (settings.Enabled or settings.AntiESP or settings.Invisible) == true,
+        return (settings.Enabled or settings.AntiESP) == true,
             serverOffset.Magnitude, now() < forceSyncUntil
     end
     -- Used by the aim: a moving square / prism keeps orbiting through a shot,
-    -- so the aim must not park it on the first occluded frame (UG / anti-ESP /
-    -- invisibility poses are deliberately unshootable and still peek
-    -- immediately).
+    -- so the aim must not park it on the first occluded frame (UG / anti-ESP
+    -- poses are deliberately unshootable and still peek immediately).
     env.AdvancedAAIsOrbit = function()
         return settings.Enabled == true
             and (settings.Square or settings.Prism or settings.Omniscient)
             and not settings.Underground
             and not settings.AntiESP
-            and not settings.Invisible
     end
     env.AdvancedAADesync = function()
         if now() < forceSyncUntil then return 0 end
@@ -6760,13 +7209,6 @@ do
             local root = character and character:FindFirstChild("HumanoidRootPart")
             if root then return HiddenOffset(root) end
         end
-        -- Invisibility: a STATIC hide. Drop the server body straight down
-        -- under the floor at the same XZ - no lateral orbit, no reroll - so
-        -- other clients have no visible pose to draw while our own body and
-        -- camera are restored every frame.
-        if settings.Invisible then
-            return Vector3.new(0, -effectiveDepth(), 0)
-        end
         -- Anti-ESP character spoof: everything other clients see (ESP box,
         -- chams, their aimbot's target position) follows the pose the server
         -- holds, so displacing it breaks their lock. Our own shots are built
@@ -6892,9 +7334,9 @@ do
             end
             return
         end
-        if not settings.Enabled and not settings.AntiESP and not settings.Invisible then return end
+        if not settings.Enabled and not settings.AntiESP then return end
         if promptHeld then return end
-        local hideActive = settings.AntiESP or settings.Invisible
+        local hideActive = settings.AntiESP
         local t = now()
         if t < pausedUntil or t < forceSyncUntil or t < peekUntil then return end
         local character = LocalPlayer.Character
@@ -7016,13 +7458,20 @@ do
     -- above ground) and the two would only fight over the Y axis.
     local undergroundToggle, ugHorizontalToggle, omniscientToggle
 
-    section:Toggle({
+    local advancedToggle
+    advancedToggle = section:Toggle({
         Name = "advanced aa", Flag = "advanced_aa_enabled", Default = false,
         Callback = function(value)
             settings.Enabled = value
             if not value then restorePose(); clearServerPose() end
         end,
     })
+    -- Bridge so other features (and the peek resolver's own toggles) can switch
+    -- the displacement on programmatically. This displacement is what actually
+    -- makes incoming shots miss - a client-side CanQuery strip cannot.
+    env.AdvancedAASetEnabled = function(value)
+        if advancedToggle then advancedToggle:Set(value == true) end
+    end
     section:Toggle({ Name = "square", Flag = "advanced_aa_square", Default = true,
         Callback = function(value) settings.Square = value end })
     section:Toggle({ Name = "prism", Flag = "advanced_aa_prism", Default = false,
@@ -7064,7 +7513,7 @@ do
         Callback = function(value)
             settings.AntiESP = value
             hiddenSpot, hiddenSpotAt = nil, 0
-            if not value and not settings.Invisible and not settings.Enabled then
+            if not value and not settings.Enabled then
                 restorePose()
                 clearServerPose()
             end
@@ -7159,6 +7608,7 @@ do
         assemblyCharacter = nil
         if env.AdvancedAAPause == pauseAA then env.AdvancedAAPause = nil end
         if env.AdvancedAAForceSync == forceSync then env.AdvancedAAForceSync = nil end
+        env.AdvancedAASetEnabled = nil
         env.AdvancedAAStatus = nil
         env.AdvancedAADesync = nil
         env.AdvancedAAOffset = nil
@@ -7169,7 +7619,6 @@ do
         overrideRoot = nil
         env.AdvancedAAPeek = nil
         env.AdvancedAAIsOrbit = nil
-        env.AdvancedAASetInvisible = nil
         env.AdvancedAAFeedback = nil
         env.AdvancedAAAutoDepth = nil
         env.AdvancedAASyncWindow = nil
@@ -7268,6 +7717,741 @@ end
                 if not seen[plr] then destroyHull(plr) end
             end
         end)
+    end
+    --#endregion
+
+
+    --#region custom view model
+    -- Client-only first-person view model: a copy of the gun you are holding
+    -- plus arms, drawn in front of the camera. It appears only while a gun
+    -- (ToolType == "Gun") is equipped and, because it is parented to the
+    -- camera, it shows in third person too. Nothing here is replicated - the
+    -- model lives on your client only.
+    do
+        local ViewModel = {
+            Enabled = false,
+            Offset = Vector3.new(0.55, -0.55, -1.3),   -- x right, y up, z back
+            Rotation = Vector3.new(0, 0, 0),           -- pitch, yaw, roll (deg)
+            Spin = 0,                                  -- deg/s, counter-clockwise (horizontal)
+            Arms = true,
+            Bob = true,
+            BobAmount = 0.045,
+            ReplaceFirstPerson = true,                 -- hide the default 1st-person model
+            Chams = false,                             -- paint the whole model (gun + arms)
+            ChamsColor = Color3.fromRGB(120, 200, 255),
+            ChamsRainbow = false,
+            ChamsRainbowSpeed = 0.2,
+            ChamsMaterial = "Neon",
+            ChamsTransparency = 0,
+            MuzzleFlash = true,
+            MuzzleColor = Color3.fromRGB(255, 196, 96),
+        }
+
+        local ChamsMaterials = { "Neon", "ForceField", "Glass", "Solid" }
+        local ChamsMaterialEnums = {
+            Neon = Enum.Material.Neon,
+            ForceField = Enum.Material.ForceField,
+            Glass = Enum.Material.Glass,
+            Solid = Enum.Material.SmoothPlastic,
+        }
+
+        local model
+        local entries = {}
+        local activeTool
+        local pendingBuild = false
+        local readyAt = 0
+        local bobPhase = 0
+        local spinAngle = 0
+        local lastBase
+        local MuzzleLocal
+        -- Forward-declared so the RenderStepped loop (defined below) can drive
+        -- muzzle-flash animation even though the flash code sits further down.
+        local activeFlashes = {}
+        local updateFlashes
+
+        -- Rotate a part so its local "axis" points along "d".
+        local function alignAxis(localAxis, d)
+            local dot = math.clamp(localAxis:Dot(d), -1, 1)
+            if dot > 0.9999 then return CFrame.new() end
+            if dot < -0.9999 then
+                local perp = math.abs(localAxis.X) < 0.9 and Vector3.xAxis or Vector3.yAxis
+                return CFrame.fromAxisAngle(localAxis:Cross(perp).Unit, math.pi)
+            end
+            return CFrame.fromAxisAngle(localAxis:Cross(d).Unit, math.acos(dot))
+        end
+
+        -- Stretch and aim a limb part so it spans from "from" to "to" and return
+        -- its base-space CFrame. The size and orientation are constant for a
+        -- given pose, so they are computed once here instead of every frame.
+        local function prepareLimb(part, from, to)
+            local dir = to - from
+            local length = math.max(dir.Magnitude, 0.05)
+            local d = (from - to).Unit
+            local size = part.Size
+            local ai, localAxis
+            if size.Y >= size.X and size.Y >= size.Z then
+                ai, localAxis = 2, Vector3.yAxis
+            elseif size.X >= size.Z then
+                ai, localAxis = 1, Vector3.xAxis
+            else
+                ai, localAxis = 3, Vector3.zAxis
+            end
+            if ai == 1 then
+                part.Size = Vector3.new(length, size.Y, size.Z)
+            elseif ai == 2 then
+                part.Size = Vector3.new(size.X, length, size.Z)
+            else
+                part.Size = Vector3.new(size.X, size.Y, length)
+            end
+            return CFrame.new((from + to) * 0.5) * alignAxis(localAxis, d)
+        end
+
+        local function prepClone(clone, opaque)
+            for _, child in ipairs(clone:GetChildren()) do
+                if child:IsA("JointInstance") or child:IsA("WeldConstraint") then
+                    child:Destroy()
+                end
+            end
+            clone.Anchored = true
+            clone.CanCollide = false
+            clone.CanQuery = false
+            clone.CanTouch = false
+            clone.CastShadow = false
+            clone.Massless = true
+            clone.LocalTransparencyModifier = 0
+            if opaque then clone.Transparency = 0 end
+        end
+
+        -- Chams: repaint a cloned part as a flat, glowing shell. Decals / mesh
+        -- textures are stripped once so the colour reads clean, exactly like the
+        -- tool-chams feature; the colour / material / transparency are re-applied
+        -- every frame (see the render loop) so the colourpicker, transparency
+        -- slider and rainbow all take effect without rebuilding the model.
+        local function stripVisuals(part)
+            for _, d in ipairs(part:GetDescendants()) do
+                if d:IsA("Decal") or d:IsA("Texture") then
+                    d.Transparency = 1
+                elseif d:IsA("SpecialMesh") then
+                    d.TextureId = ""
+                elseif d:IsA("SurfaceAppearance") then
+                    -- A SurfaceAppearance overrides Color / Material entirely, so
+                    -- the cham colour would never show. Drop it for the shell.
+                    d:Destroy()
+                end
+            end
+            if part:IsA("MeshPart") then
+                part.TextureID = ""
+                local surface = part:FindFirstChildOfClass("SurfaceAppearance")
+                if surface then surface:Destroy() end
+            end
+        end
+
+        local function paintPart(part)
+            part.Color = ViewModel.ChamsColor
+            part.Material = ChamsMaterialEnums[ViewModel.ChamsMaterial] or Enum.Material.Neon
+            part.Transparency = ViewModel.ChamsTransparency
+        end
+
+        local function addRigid(parent, clone, rel, opaque, arm)
+            prepClone(clone, opaque)
+            clone.Parent = parent
+            entries[#entries + 1] = { kind = "rigid", part = clone, rel = rel, arm = arm }
+            if ViewModel.Chams then stripVisuals(clone) end
+        end
+
+        local function addLimb(parent, clone, from, to, opaque, arm)
+            prepClone(clone, opaque)
+            clone.Parent = parent
+            local localCF = prepareLimb(clone, from, to)
+            entries[#entries + 1] = { kind = "limb", part = clone, localCF = localCF, arm = arm }
+            if ViewModel.Chams then stripVisuals(clone) end
+        end
+
+        local function grab(name)
+            local character = LocalPlayer.Character
+            return character and character:FindFirstChild(name)
+        end
+
+        -- Arms are cloned from your own character (so they carry your skin /
+        -- shirt) and posed to reach the gun's grip and foregrip.
+        local function buildArms(parent)
+            local rightUpper, rightLower, rightHand = grab("RightUpperArm"), grab("RightLowerArm"), grab("RightHand")
+            local leftUpper, leftLower, leftHand = grab("LeftUpperArm"), grab("LeftLowerArm"), grab("LeftHand")
+            local rShoulder = Vector3.new(0.75, -0.85, 1.25)
+            local rElbow = Vector3.new(0.55, -0.95, 0.45)
+            local rHand = Vector3.new(0.06, -0.12, -0.10)
+            local lShoulder = Vector3.new(-0.75, -0.85, 1.25)
+            local lElbow = Vector3.new(-0.55, -0.95, 0.45)
+            local lHand = Vector3.new(-0.06, -0.18, -1.00)
+            if rightUpper and leftUpper then
+                addLimb(parent, rightUpper:Clone(), rShoulder, rElbow, true, true)
+                if rightLower then addLimb(parent, rightLower:Clone(), rElbow, rHand, true, true) end
+                if rightHand then addRigid(parent, rightHand:Clone(), CFrame.new(rHand), true, true) end
+                addLimb(parent, leftUpper:Clone(), lShoulder, lElbow, true, true)
+                if leftLower then addLimb(parent, leftLower:Clone(), lElbow, lHand, true, true) end
+                if leftHand then addRigid(parent, leftHand:Clone(), CFrame.new(lHand), true, true) end
+                return
+            end
+            local rArm, lArm = grab("Right Arm"), grab("Left Arm")
+            if rArm then addLimb(parent, rArm:Clone(), rShoulder, rHand, true, true) end
+            if lArm then addLimb(parent, lArm:Clone(), lShoulder, lHand, true, true) end
+        end
+
+        local function teardown()
+            if model then
+                model:Destroy()
+                model = nil
+            end
+            table.clear(entries)
+            lastBase = nil
+        end
+
+        -- Muzzle point: the forward-most corner of any gun part, in the model's
+        -- own base space (the frame the entries are posed against). Tracers and
+        -- the flash start here.
+        local function computeMuzzle()
+            MuzzleLocal = nil
+            local best = math.huge
+            for _, entry in ipairs(entries) do
+                if not entry.arm and entry.rel then
+                    local h = entry.part.Size * 0.5
+                    for ix = -1, 1, 2 do
+                        for iy = -1, 1, 2 do
+                            for iz = -1, 1, 2 do
+                                local p = entry.rel * Vector3.new(h.X * ix, h.Y * iy, h.Z * iz)
+                                if p.Z < best then
+                                    best = p.Z
+                                    MuzzleLocal = p
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        local function build(tool)
+            teardown()
+            local camera = workspace.CurrentCamera
+            local handle = tool and (tool:FindFirstChild("Handle") or tool:FindFirstChildWhichIsA("BasePart"))
+            if not camera or not handle then return end
+            local origin = handle.CFrame
+            local holder = Instance.new("Model")
+            holder.Name = "CustomViewModel"
+            for _, obj in ipairs(tool:GetDescendants()) do
+                if obj:IsA("BasePart") then
+                    addRigid(holder, obj:Clone(), origin:Inverse() * obj.CFrame, false, false)
+                end
+            end
+            if ViewModel.Arms then buildArms(holder) end
+            computeMuzzle()
+            holder.Parent = camera
+            model = holder
+        end
+
+        local function equippedGun()
+            local character = LocalPlayer.Character
+            local tool = character and character:FindFirstChildOfClass("Tool")
+            if tool and tool:GetAttribute("ToolType") == "Gun" then return tool end
+            return nil
+        end
+
+        -- The camera can be swapped on respawn; drop the model so it is rebuilt
+        -- under the new camera (a camera-parented model dies with its parent).
+        workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+            teardown()
+            activeTool = nil
+            pendingBuild = false
+        end)
+
+        -- Replace the default first-person view model. Roblox's camera draws your
+        -- own arms and the equipped tool's handle in first person; when the custom
+        -- model is active we hide those parts (LocalTransparencyModifier = 1) so
+        -- they no longer fill the screen. The camera rewrites that modifier every
+        -- frame, so this runs in a render step ordered just after it, and the
+        -- values are put back as soon as we leave first person (or the model is
+        -- switched off) so third person and the normal body stay intact.
+        local hiddenParts = {}
+        -- The camera rewrites LocalTransparencyModifier every frame, so the body
+        -- parts have to be re-hidden every frame. Rebuilding that list every frame
+        -- meant a GetDescendants() allocation per call, so it is cached and only
+        -- refreshed when the body or the equipped tool actually changes.
+        local hideList = {}
+        local hideListNext = 0
+        local hideListCharacter, hideListTool
+
+        local function restoreHidden()
+            for part in pairs(hiddenParts) do
+                -- Only BaseParts carry LocalTransparencyModifier. Touching any other
+                -- descendant used to throw, which aborted the loop, left the table
+                -- half-cleared and so re-threw every single frame.
+                if part:IsA("BasePart") and part.Parent and part.LocalTransparencyModifier ~= 0 then
+                    part.LocalTransparencyModifier = 0
+                end
+                hiddenParts[part] = nil
+            end
+        end
+
+        -- True only while the camera is actually in first person. The default
+        -- camera keeps Camera.Focus on the point it orbits: in first person the
+        -- camera sits right on that focus (zoom ~0.5 studs), while third person
+        -- is always further out. Measuring the zoom cleanly separates the two,
+        -- which a fixed distance-to-head test cannot do (the head sits ~1.5 studs
+        -- off the camera even in first person, so it overlaps close third person).
+        local function isFirstPerson()
+            local camera = workspace.CurrentCamera
+            local character = LocalPlayer.Character
+            if not camera or not character then return false end
+            local head = character:FindFirstChild("Head")
+            if not head then return false end
+
+            local focus = camera.Focus
+            local zoom = (camera.CFrame.Position - focus.Position).Magnitude
+            -- Only trust the zoom when the focus is genuinely on this character
+            -- (a custom camera may leave Focus stale).
+            if (focus.Position - head.Position).Magnitude < 10 then
+                return zoom < 1.5
+            end
+            return (camera.CFrame.Position - head.Position).Magnitude < 1.0
+        end
+
+        -- When a gun was last equipped. The auto weapon switcher briefly leaves the
+        -- character with no tool between guns, so the body has to stay hidden across
+        -- that gap instead of flashing back on (and blocking the view) each swap.
+        local lastGunAt = 0
+
+        local function wantsDefaultHidden()
+            if not (ViewModel.Enabled and ViewModel.ReplaceFirstPerson and isFirstPerson()) then
+                return false
+            end
+            -- A pending build still counts as "replacing": the model is torn down
+            -- and rebuilt after every weapon swap, and the body must not reappear
+            -- during that window.
+            if activeTool ~= nil or pendingBuild then return true end
+            return os.clock() - lastGunAt < 0.6
+        end
+
+        local function hideDefault()
+            local character = LocalPlayer.Character
+            if not character then return end
+            local tool = character:FindFirstChildOfClass("Tool")
+            local now = os.clock()
+            if now >= hideListNext or hideListCharacter ~= character or hideListTool ~= tool then
+                hideListNext = now + 0.25
+                hideListCharacter = character
+                hideListTool = tool
+                table.clear(hideList)
+                for _, part in ipairs(character:GetDescendants()) do
+                    if part:IsA("BasePart") then hideList[#hideList + 1] = part end
+                end
+                if tool then
+                    for _, part in ipairs(tool:GetDescendants()) do
+                        if part:IsA("BasePart") then hideList[#hideList + 1] = part end
+                    end
+                end
+                -- Some games draw their own first-person model as a child of the
+                -- camera. Hide any such model too, but never our own.
+                local camera = workspace.CurrentCamera
+                if camera then
+                    for _, obj in ipairs(camera:GetChildren()) do
+                        if obj ~= model then
+                            if obj:IsA("BasePart") then
+                                hideList[#hideList + 1] = obj
+                            elseif obj:IsA("Model") then
+                                for _, part in ipairs(obj:GetDescendants()) do
+                                    if part:IsA("BasePart") then hideList[#hideList + 1] = part end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            for _, part in ipairs(hideList) do
+                if part.Parent and part.LocalTransparencyModifier ~= 1 then
+                    part.LocalTransparencyModifier = 1
+                end
+                hiddenParts[part] = true
+            end
+        end
+
+        local function updateFirstPersonReplace()
+            if wantsDefaultHidden() then
+                hideDefault()
+            elseif next(hiddenParts) then
+                restoreHidden()
+            end
+        end
+
+        -- The camera rewrites LocalTransparencyModifier every frame, so this runs
+        -- right after the camera's own step. It is also run on the very last event
+        -- before the frame is drawn (PreRender, falling back to RenderStepped) so
+        -- nothing can re-show the body after us.
+        RunService:BindToRenderStep("ViewModelHideDefault", Enum.RenderPriority.Camera.Value + 1, updateFirstPersonReplace)
+        if RunService.PreRender then
+            RunService.PreRender:Connect(updateFirstPersonReplace)
+        else
+            RunService.RenderStepped:Connect(updateFirstPersonReplace)
+        end
+
+        RunService.RenderStepped:Connect(function(dt)
+            -- Keep muzzle-flash pops alive even if the model is toggled off.
+            if #activeFlashes > 0 then updateFlashes(os.clock()) end
+            local gun = ViewModel.Enabled and equippedGun() or nil
+            if gun then
+                lastGunAt = os.clock()
+                if gun ~= activeTool then
+                    -- Keep the old model on screen until the new one is built, so a
+                    -- weapon swap never flashes an empty first-person view (and the
+                    -- body never gets a chance to reappear).
+                    activeTool = gun
+                    pendingBuild = true
+                    -- Let the equipped tool's welds settle before cloning it.
+                    readyAt = os.clock() + 0.1
+                end
+            elseif not ViewModel.Enabled or os.clock() - lastGunAt > 0.4 then
+                -- View model switched off, or the gun has been gone long enough to
+                -- count as holstered: drop the model. A brief no-tool moment between
+                -- two guns does not tear it down.
+                if activeTool ~= nil or model then
+                    activeTool = nil
+                    teardown()
+                    pendingBuild = false
+                end
+            end
+            if pendingBuild and activeTool and os.clock() >= readyAt then
+                build(activeTool)
+                pendingBuild = false
+            end
+            if not (ViewModel.Enabled and model and activeTool) then return end
+            local camera = workspace.CurrentCamera
+            if not camera then return end
+            if model.Parent ~= camera then model.Parent = camera end
+
+            local step = math.clamp(dt or 0.016, 0, 0.1)
+            if ViewModel.Spin ~= 0 then
+                spinAngle = (spinAngle + step * ViewModel.Spin) % 360
+            elseif spinAngle ~= 0 then
+                -- Spin switched off: ease back to the original (un-spun) pose so
+                -- the model always ends up exactly where it started.
+                local delta = ((0 - spinAngle + 180) % 360) - 180
+                if math.abs(delta) < 0.5 then
+                    spinAngle = 0
+                else
+                    spinAngle = (spinAngle + delta * math.min(step * 8, 1)) % 360
+                end
+            end
+            local base = camera.CFrame
+                * CFrame.new(ViewModel.Offset)
+                -- Horizontal spin: yaw about the model's vertical axis, so it
+                -- always turns counter-clockwise as seen from above.
+                * CFrame.Angles(0, math.rad(spinAngle), 0)
+                * CFrame.Angles(math.rad(ViewModel.Rotation.X), math.rad(ViewModel.Rotation.Y), math.rad(ViewModel.Rotation.Z))
+            lastBase = base
+
+            if ViewModel.Bob then
+                local character = LocalPlayer.Character
+                local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+                local move = humanoid and humanoid.MoveDirection.Magnitude or 0
+                bobPhase += step * (7 + move * 5)
+                local amount = ViewModel.BobAmount * move
+                base = base * CFrame.new(math.sin(bobPhase) * amount, -math.abs(math.cos(bobPhase)) * amount, 0)
+                    * CFrame.Angles(0, math.sin(bobPhase) * amount * 0.4, -math.sin(bobPhase) * amount * 0.4)
+            end
+
+            local paint = ViewModel.Chams
+            if paint and ViewModel.ChamsRainbow then
+                local h, s, v = ViewModel.ChamsColor:ToHSV()
+                ViewModel.ChamsColor = Color3.fromHSV((h + step * ViewModel.ChamsRainbowSpeed) % 1, s, v)
+            end
+
+            for _, entry in ipairs(entries) do
+                if entry.kind == "limb" then
+                    entry.part.CFrame = base * entry.localCF
+                else
+                    entry.part.CFrame = base * entry.rel
+                end
+                if paint then paintPart(entry.part) end
+            end
+        end)
+
+        -- Muzzle flash: a bright core pop, a spray of forward embers and a short
+        -- light flash right at the barrel. Rigs are pooled so high fire rates do
+        -- not churn instances; each is returned once its particles have died.
+        local flashPool = {}
+        local FLASH_POOL_LIMIT = 16
+
+        local function newFlashRig()
+            local core = Instance.new("Part")
+            core.Name = "ViewModelMuzzleFX"
+            core.Anchored, core.CanCollide, core.CanQuery, core.CanTouch = true, false, false, false
+            core.CastShadow = false
+            core.Material = Enum.Material.Neon
+            core.Shape = Enum.PartType.Ball
+            core.Size = Vector3.new(0.1, 0.1, 0.1)
+            core.Transparency = 1
+            core.Parent = workspace
+
+            local attachment = Instance.new("Attachment")
+            attachment.Parent = core
+
+            local light = Instance.new("PointLight")
+            light.Range = 12
+            light.Brightness = 0
+            light.Parent = core
+
+            -- Soft core bloom: a very short, bright puff of light.
+            local bloom = Instance.new("ParticleEmitter")
+            bloom.Texture = "rbxasset://textures/particles/sparkles_main.dds"
+            bloom.LightEmission = 1
+            bloom.LightInfluence = 0
+            bloom.Rate = 0
+            bloom.Lifetime = NumberRange.new(0.05, 0.09)
+            bloom.Speed = NumberRange.new(1, 3)
+            bloom.SpreadAngle = Vector2.new(24, 24)
+            bloom.Size = NumberSequence.new({
+                NumberSequenceKeypoint.new(0, 0.9),
+                NumberSequenceKeypoint.new(1, 0),
+            })
+            bloom.Transparency = NumberSequence.new({
+                NumberSequenceKeypoint.new(0, 0.1),
+                NumberSequenceKeypoint.new(1, 1),
+            })
+            bloom.Parent = attachment
+
+            -- Embers thrown forward down the barrel.
+            local sparks = Instance.new("ParticleEmitter")
+            sparks.Texture = "rbxasset://textures/particles/sparkles_main.dds"
+            sparks.LightEmission = 1
+            sparks.LightInfluence = 0
+            sparks.Rate = 0
+            sparks.EmissionDirection = Enum.NormalId.Front
+            sparks.Lifetime = NumberRange.new(0.14, 0.28)
+            sparks.Speed = NumberRange.new(18, 34)
+            sparks.SpreadAngle = Vector2.new(5, 5)
+            sparks.Drag = 5
+            sparks.Acceleration = Vector3.new(0, -35, 0)
+            sparks.Size = NumberSequence.new({
+                NumberSequenceKeypoint.new(0, 0.2),
+                NumberSequenceKeypoint.new(1, 0),
+            })
+            sparks.Transparency = NumberSequence.new({
+                NumberSequenceKeypoint.new(0, 0.05),
+                NumberSequenceKeypoint.new(0.5, 0.35),
+                NumberSequenceKeypoint.new(1, 1),
+            })
+            sparks.Parent = attachment
+
+            return { core = core, light = light, bloom = bloom, sparks = sparks }
+        end
+
+        local function takeFlashRig()
+            while true do
+                local rig = table.remove(flashPool)
+                if not rig then return newFlashRig() end
+                if rig.core then
+                    rig.core.Parent = workspace
+                    return rig
+                end
+            end
+        end
+
+        local function releaseFlashRig(rig)
+            if not rig.core then return end
+            rig.core.Parent = nil
+            if #flashPool < FLASH_POOL_LIMIT then
+                table.insert(flashPool, rig)
+            else
+                rig.core:Destroy()
+            end
+        end
+
+        -- Per-shot core animation is driven by one shared update pass (the
+        -- RenderStepped loop below) instead of a thread per shot, and the colour
+        -- sequences are cached until the muzzle colour actually changes.
+        local flashSeqSource
+        local flashSeqBloom
+        local flashSeqSpark
+
+        local function flashSequences(color)
+            if flashSeqSource ~= color then
+                flashSeqSource = color
+                flashSeqBloom = ColorSequence.new(color:Lerp(Color3.new(1, 1, 1), 0.7))
+                flashSeqSpark = ColorSequence.new(color)
+            end
+            return flashSeqBloom, flashSeqSpark
+        end
+
+        local FLASH_POP = 0.08      -- core pop time
+        local FLASH_LIFE = 0.35     -- reserve the rig until the embers are gone
+
+        updateFlashes = function(now)
+            local i = 1
+            while i <= #activeFlashes do
+                local entry = activeFlashes[i]
+                local rig = entry.rig
+                local elapsed = now - entry.start
+                if elapsed >= FLASH_LIFE then
+                    rig.core.Transparency = 1
+                    rig.core.Size = Vector3.new(0.1, 0.1, 0.1)
+                    rig.light.Brightness = 0
+                    releaseFlashRig(rig)
+                    table.remove(activeFlashes, i)
+                else
+                    if elapsed < FLASH_POP then
+                        local alpha = elapsed / FLASH_POP
+                        local scale = 0.42 + 0.5 * alpha
+                        rig.core.Size = Vector3.new(scale, scale, scale)
+                        rig.core.Transparency = 0.05 + 0.95 * alpha
+                        rig.light.Brightness = 6 * (1 - alpha)
+                    end
+                    i += 1
+                end
+            end
+        end
+
+        local function spawnMuzzleFlash(cf)
+            local rig = takeFlashRig()
+            local color = ViewModel.MuzzleColor
+            local bloomSeq, sparkSeq = flashSequences(color)
+
+            rig.core.CFrame = cf
+            rig.core.Color = color
+            rig.core.Size = Vector3.new(0.42, 0.42, 0.42)
+            rig.core.Transparency = 0.05
+
+            rig.light.Color = color
+            rig.light.Brightness = 6
+
+            rig.bloom.Color = bloomSeq
+            rig.sparks.Color = sparkSeq
+
+            rig.bloom:Emit(2)
+            rig.sparks:Emit(math.random(7, 12))
+
+            activeFlashes[#activeFlashes + 1] = { rig = rig, start = os.clock() }
+        end
+
+        -- Called from the shot paths (see the forward declaration near the top of
+        -- the file). Draws the muzzle flash at the view model's barrel and, when
+        -- tracers are on, a tracer that starts at that muzzle. Falls back to the
+        -- plain head tracer when the view model is off.
+        ViewModelShot = function(hitPoint, fallbackOrigin)
+            local muzzle
+            if ViewModel.Enabled and model and activeTool and lastBase then
+                muzzle = lastBase * CFrame.new(MuzzleLocal or Vector3.new(0, 0, -1))
+            end
+            if muzzle then
+                if ViewModel.MuzzleFlash then spawnMuzzleFlash(muzzle) end
+                if TracerEnabled and typeof(hitPoint) == "Vector3" then
+                    CreateTracer(muzzle.Position, hitPoint, Vector3.zero)
+                end
+            elseif TracerEnabled and typeof(hitPoint) == "Vector3" and typeof(fallbackOrigin) == "Vector3" then
+                CreateTracer(fallbackOrigin, hitPoint, Vector3.zero)
+            end
+        end
+
+        Sections.visuals:Toggle({
+            Name = "custom view model"; Flag = "viewmodel"; Default = false;
+            Callback = function(v)
+                ViewModel.Enabled = v
+                -- Pre-warm the flash pool so the first shots do not pay for
+                -- instance creation mid-fire.
+                if v then
+                    for _ = 1, 4 do
+                        if #flashPool >= 4 then break end
+                        local rig = newFlashRig()
+                        rig.core.Parent = nil
+                        table.insert(flashPool, rig)
+                    end
+                end
+            end
+        })
+        Sections.visuals:Toggle({
+            Name = "replace first person model"; Flag = "viewmodelreplace"; Default = true;
+            Callback = function(v) ViewModel.ReplaceFirstPerson = v end
+        })
+        Sections.visuals:Slider({
+            Name = "view model x"; Flag = "viewmodelx"; Min = -3; Max = 3; Default = 0.55; Decimals = 0.05;
+            Callback = function(v) ViewModel.Offset = Vector3.new(v, ViewModel.Offset.Y, ViewModel.Offset.Z) end
+        })
+        Sections.visuals:Slider({
+            Name = "view model y"; Flag = "viewmodely"; Min = -3; Max = 3; Default = -0.55; Decimals = 0.05;
+            Callback = function(v) ViewModel.Offset = Vector3.new(ViewModel.Offset.X, v, ViewModel.Offset.Z) end
+        })
+        Sections.visuals:Slider({
+            Name = "view model z (fwd)"; Flag = "viewmodelz"; Min = -4; Max = 0; Default = -1.3; Decimals = 0.05;
+            Callback = function(v) ViewModel.Offset = Vector3.new(ViewModel.Offset.X, ViewModel.Offset.Y, v) end
+        })
+        Sections.visuals:Slider({
+            Name = "view model pitch"; Flag = "viewmodelpitch"; Min = -180; Max = 180; Default = 0; Decimals = 1;
+            Callback = function(v) ViewModel.Rotation = Vector3.new(v, ViewModel.Rotation.Y, ViewModel.Rotation.Z) end
+        })
+        Sections.visuals:Slider({
+            Name = "view model yaw"; Flag = "viewmodelyaw"; Min = -180; Max = 180; Default = 0; Decimals = 1;
+            Callback = function(v) ViewModel.Rotation = Vector3.new(ViewModel.Rotation.X, v, ViewModel.Rotation.Z) end
+        })
+        Sections.visuals:Slider({
+            Name = "view model roll"; Flag = "viewmodelroll"; Min = -180; Max = 180; Default = 0; Decimals = 1;
+            Callback = function(v) ViewModel.Rotation = Vector3.new(ViewModel.Rotation.X, ViewModel.Rotation.Y, v) end
+        })
+        Sections.visuals:Slider({
+            Name = "view model spin (deg/s, ccw)"; Flag = "viewmodelspin"; Min = 0; Max = 720; Default = 0; Decimals = 1;
+            Callback = function(v) ViewModel.Spin = v end
+        })
+        Sections.visuals:Toggle({
+            Name = "view model arms"; Flag = "viewmodelarms"; Default = true;
+            Callback = function(v)
+                ViewModel.Arms = v
+                activeTool = nil   -- force a rebuild so the arms appear / vanish now
+            end
+        })
+        Sections.visuals:Toggle({
+            Name = "view model bob"; Flag = "viewmodelbob"; Default = true;
+            Callback = function(v) ViewModel.Bob = v end
+        })
+        Sections.visuals:Slider({
+            Name = "view model bob amount"; Flag = "viewmodelbobamt"; Min = 0; Max = 0.2; Default = 0.045; Decimals = 0.005;
+            Callback = function(v) ViewModel.BobAmount = v end
+        })
+        Sections.visuals:Toggle({
+            Name = "view model muzzle flash"; Flag = "viewmodelmuzzle"; Default = true;
+            Callback = function(v) ViewModel.MuzzleFlash = v end
+        })
+        Sections.visuals:Label({Name = "view model muzzle color"}):Colorpicker({
+            Name = "view model muzzle color"; Flag = "viewmodelmuzzlecolor";
+            Default = ViewModel.MuzzleColor;
+            Callback = function(v) ViewModel.MuzzleColor = v end
+        })
+        Sections.visuals:Toggle({
+            Name = "view model chams"; Flag = "viewmodelchams"; Default = false;
+            Callback = function(v)
+                ViewModel.Chams = v
+                activeTool = nil   -- rebuild so the model repaints now
+            end
+        })
+        Sections.visuals:Label({Name = "view model chams color"}):Colorpicker({
+            Name = "view model chams color"; Flag = "viewmodelchamscolor";
+            Default = ViewModel.ChamsColor;
+            Callback = function(v) ViewModel.ChamsColor = v end
+        })
+        Sections.visuals:Toggle({
+            Name = "view model chams rainbow"; Flag = "viewmodelchamsrainbow"; Default = false;
+            Callback = function(v) ViewModel.ChamsRainbow = v end
+        })
+        Sections.visuals:Slider({
+            Name = "view model chams rainbow speed"; Flag = "viewmodelchamsrainbowspeed";
+            Min = 0.05; Max = 1; Default = ViewModel.ChamsRainbowSpeed; Decimals = 0.01;
+            Callback = function(v) ViewModel.ChamsRainbowSpeed = v end
+        })
+        Sections.visuals:Dropdown({
+            Name = "view model chams material"; Flag = "viewmodelchamsmat";
+            Items = ChamsMaterials; Default = "Neon";
+            Callback = function(v) ViewModel.ChamsMaterial = v end
+        })
+        Sections.visuals:Slider({
+            Name = "view model chams transparency"; Flag = "viewmodelchamstrans"; Min = 0; Max = 1; Default = 0; Decimals = 0.05;
+            Callback = function(v) ViewModel.ChamsTransparency = v end
+        })
     end
     --#endregion
 
