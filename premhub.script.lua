@@ -314,9 +314,14 @@
 
     local CreateTracer;
     -- Custom view-model shot hook (assigned near the end of the file). The shot
-    -- paths call this so tracers and the muzzle flash come from the view model
-    -- instead of the head. Nil until that region runs.
+    -- paths call this so the tracer starts at the view model's barrel instead of
+    -- the head. Nil until that region runs.
     local ViewModelShot;
+    -- Custom view-model muzzle accessor (assigned near the end of the file). It
+    -- returns the barrel's world CFrame while the view model is drawn, so the
+    -- snap line can start from the gun barrel instead of the crosshair. Nil
+    -- until that region runs.
+    local ViewModelMuzzle;
     local TracerEnabled = false;
     local TracerSpeed = 900;
     local TracerBend = 0.75;
@@ -2277,8 +2282,8 @@ do -- combat
                 end
                 if plan then
                     SilentAimTarget = target
-                    -- Tracer / muzzle flash are drawn from the namecall choke
-                    -- point below so every fired shot gets exactly one.
+                    -- The tracer is drawn from the namecall choke point below so
+                    -- every fired shot gets exactly one.
                     return plan.FinalPart, plan.point
                 end
             end
@@ -3575,6 +3580,264 @@ do -- combat
         })
 
 
+    --#endregion
+
+    --#region snap line
+    -- A line from the crosshair to whatever the aim is currently locked on to,
+    -- so the snap is visible before the shot lands. One reused Drawing line,
+    -- updated in the render step; nothing is allocated per frame.
+    do
+        local SnapLine = {
+            Enabled = false,
+            Color = Color3.fromRGB(255, 255, 255),
+            Thickness = 1.5,
+            Transparency = 1,
+        }
+
+        local line = Drawing.new("Line")
+        line.Visible = false
+        line.Thickness = SnapLine.Thickness
+        line.Transparency = SnapLine.Transparency
+        line.Color = SnapLine.Color
+
+        RunService.RenderStepped:Connect(function()
+            if not SnapLine.Enabled then
+                if line.Visible then line.Visible = false end
+                return
+            end
+            local camera = workspace.CurrentCamera
+            local target = camera and GetTarget() or nil
+            if not target or not target.Parent then
+                if line.Visible then line.Visible = false end
+                return
+            end
+            local point, onScreen = camera:WorldToViewportPoint(target.Position)
+            if not onScreen or point.Z <= 0 then
+                if line.Visible then line.Visible = false end
+                return
+            end
+            -- Start from the gun barrel when the custom view model is drawing,
+            -- so the line comes out of the muzzle instead of the crosshair.
+            local from = UserInputService:GetMouseLocation()
+            local muzzle = ViewModelMuzzle and ViewModelMuzzle()
+            if muzzle then
+                local mpoint, mOnScreen = camera:WorldToViewportPoint(muzzle.Position)
+                if mOnScreen and mpoint.Z > 0 then
+                    from = Vector2.new(mpoint.X, mpoint.Y)
+                end
+            end
+            line.From = from
+            line.To = Vector2.new(point.X, point.Y)
+            line.Color = SnapLine.Color
+            line.Thickness = SnapLine.Thickness
+            line.Transparency = SnapLine.Transparency
+            line.Visible = true
+        end)
+
+        Sections.visuals:Toggle({
+            Name = 'snap line';
+            Flag = 'snapline';
+            Default = false;
+            Callback = function(v) SnapLine.Enabled = v end
+        })
+
+        Sections.visuals:Label({Name = 'snap line color'}):Colorpicker({
+            Name = 'snap line color';
+            Flag = 'snaplinecolor';
+            Default = SnapLine.Color;
+            Callback = function(v) SnapLine.Color = v end
+        })
+
+        Sections.visuals:Slider({
+            Name = 'snap line thickness';
+            Flag = 'snaplinethickness';
+            Min = 0.5; Max = 6; Default = 1.5; Decimals = 0.5;
+            Callback = function(v) SnapLine.Thickness = v end
+        })
+    end
+    --#endregion
+
+    --#region tracker
+    -- A crosshair that rides the aim target: the same lock the snap line uses,
+    -- but instead of a line from the crosshair it draws the crosshair itself on
+    -- the target's head, eased into place so it glides rather than snaps. Every
+    -- shape is a list of unit-space segments drawn with one reused Line each, so
+    -- nothing is allocated per frame.
+    do
+        local Tracker = {
+            Enabled = false,
+            Color = Color3.fromRGB(255, 255, 255),
+            Thickness = 1.5,
+            Size = 12,
+            Shape = "Crosshair",   -- Crosshair | Star of David | Polygon
+            Sides = 6,             -- points for the star / polygon
+            Smooth = 0.5,          -- 0 = instant, 1 = very smooth
+            X = 0,
+            Y = 0,
+            Has = false,           -- whether the smoothed point has been seeded
+        }
+
+        local MAX_SEGMENTS = 16
+        local segs = {}
+        for i = 1, MAX_SEGMENTS do
+            local l = Drawing.new("Line")
+            l.Visible = false
+            segs[i] = l
+        end
+
+        local function ringPoints(n)
+            local pts = {}
+            for k = 0, n - 1 do
+                local a = math.rad(90 + k * 360 / n)
+                pts[k + 1] = Vector2.new(math.cos(a), -math.sin(a))
+            end
+            return pts
+        end
+
+        local function buildSegments()
+            local list = {}
+            local shape = Tracker.Shape
+            if shape == "Star of David" then
+                -- A star polygon: jump s points around the ring each time. At the
+                -- default 6 points this is the Star of David (two triangles); at
+                -- 5 it is a pentagram, and so on.
+                local n = math.max(3, math.floor(Tracker.Sides + 0.5))
+                local s = (n % 2 == 1) and ((n - 1) / 2) or (n / 2 - 1)
+                s = math.max(1, math.floor(s))
+                local pts = ringPoints(n)
+                for k = 1, n do
+                    list[#list + 1] = { pts[k], pts[(k - 1 + s) % n + 1] }
+                end
+            elseif shape == "Polygon" then
+                local n = math.max(3, math.floor(Tracker.Sides + 0.5))
+                local pts = ringPoints(n)
+                for k = 1, n do
+                    list[#list + 1] = { pts[k], pts[k % n + 1] }
+                end
+            else
+                -- Plain crosshair: four ticks with a gap at the centre.
+                local gap, len = 0.35, 1
+                list[#list + 1] = { Vector2.new(0, -gap), Vector2.new(0, -len) }
+                list[#list + 1] = { Vector2.new(0, gap), Vector2.new(0, len) }
+                list[#list + 1] = { Vector2.new(-gap, 0), Vector2.new(-len, 0) }
+                list[#list + 1] = { Vector2.new(gap, 0), Vector2.new(len, 0) }
+            end
+            return list
+        end
+
+        local segments = buildSegments()
+        local dirty = false
+
+        local function hideAll()
+            if Tracker.Has then
+                for _, l in ipairs(segs) do
+                    if l.Visible then l.Visible = false end
+                end
+                Tracker.Has = false
+            end
+        end
+
+        RunService.RenderStepped:Connect(function(dt)
+            if not Tracker.Enabled then
+                hideAll()
+                return
+            end
+            if dirty then
+                segments = buildSegments()
+                dirty = false
+            end
+            local camera = workspace.CurrentCamera
+            local target = camera and GetTarget() or nil
+            if not target or not target.Parent then
+                hideAll()
+                return
+            end
+            local point, onScreen = camera:WorldToViewportPoint(target.Position)
+            if not onScreen or point.Z <= 0 then
+                hideAll()
+                return
+            end
+
+            local tx, ty = point.X, point.Y
+            if not Tracker.Has then
+                Tracker.X, Tracker.Y, Tracker.Has = tx, ty, true
+            else
+                -- Frame-rate independent ease. Smooth = 0 snaps; the top of the
+                -- slider gives a slow, very smooth glide.
+                local tau = math.max(Tracker.Smooth * 0.2, 0.0001)
+                local k = 1 - math.exp(-(dt or 0.016) / tau)
+                Tracker.X += (tx - Tracker.X) * k
+                Tracker.Y += (ty - Tracker.Y) * k
+            end
+
+            local cx, cy = Tracker.X, Tracker.Y
+            local size = Tracker.Size
+            for i = 1, MAX_SEGMENTS do
+                local l = segs[i]
+                local seg = segments[i]
+                if seg then
+                    l.From = Vector2.new(cx + seg[1].X * size, cy + seg[1].Y * size)
+                    l.To = Vector2.new(cx + seg[2].X * size, cy + seg[2].Y * size)
+                    l.Color = Tracker.Color
+                    l.Thickness = Tracker.Thickness
+                    l.Transparency = 1
+                    l.Visible = true
+                elseif l.Visible then
+                    l.Visible = false
+                end
+            end
+        end)
+
+        Sections.visuals:Toggle({
+            Name = 'tracker';
+            Flag = 'tracker';
+            Default = false;
+            Callback = function(v) Tracker.Enabled = v end
+        })
+
+        Sections.visuals:Dropdown({
+            Name = 'tracker shape';
+            Flag = 'trackershape';
+            Items = { "Crosshair", "Star of David", "Polygon" };
+            Default = "Crosshair";
+            Callback = function(v) Tracker.Shape = v; dirty = true end
+        })
+
+        Sections.visuals:Slider({
+            Name = 'tracker sides';
+            Flag = 'trackersides';
+            Min = 3; Max = 12; Default = 6; Decimals = 1;
+            Callback = function(v) Tracker.Sides = v; dirty = true end
+        })
+
+        Sections.visuals:Slider({
+            Name = 'tracker size';
+            Flag = 'trackersize';
+            Min = 2; Max = 60; Default = 12; Decimals = 1;
+            Callback = function(v) Tracker.Size = v end
+        })
+
+        Sections.visuals:Slider({
+            Name = 'tracker smoothing';
+            Flag = 'trackersmooth';
+            Min = 0; Max = 1; Default = 0.5; Decimals = 0.05;
+            Callback = function(v) Tracker.Smooth = v end
+        })
+
+        Sections.visuals:Label({Name = 'tracker color'}):Colorpicker({
+            Name = 'tracker color';
+            Flag = 'trackercolor';
+            Default = Tracker.Color;
+            Callback = function(v) Tracker.Color = v end
+        })
+
+        Sections.visuals:Slider({
+            Name = 'tracker thickness';
+            Flag = 'trackerthickness';
+            Min = 0.5; Max = 6; Default = 1.5; Decimals = 0.5;
+            Callback = function(v) Tracker.Thickness = v end
+        })
+    end
     --#endregion
 end 
 
@@ -6565,7 +6828,206 @@ Sections.movement:Toggle({
         end
 
     --#endregion
-        
+                --#region car fling
+        -- While you are sitting in a car, anything the car runs into - another
+        -- player or another car - is flung. Detection is the car's own Touched
+        -- events (the car is ours while we drive, so they fire locally), so the
+        -- feature does NO per-frame work at all: its idle cost is zero and a
+        -- contact costs only a few property writes. Each hit gets a large
+        -- velocity plus a physics state, held for the repeat window so it
+        -- survives the next server reconciliation.
+        do
+            local CarFling = {
+                Enabled = false,
+                Power = 1500,   -- studs/s of launch velocity
+                Lift = 0.7,     -- fraction of power added as upward launch
+                Repeat = 0.1,   -- seconds the impulse is re-applied on contact
+            }
+
+            local lastFling = WeakKeyedTable()
+            local boundParts = WeakKeyedTable()
+            local boundModels = WeakKeyedTable()
+            local boundModel
+
+            local function seatedSeat()
+                local character = LocalPlayer.Character
+                local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+                return humanoid and humanoid.SeatPart
+            end
+
+            local function flingRoot(root, origin)
+                if not root or not root.Parent then return end
+                -- Never launch ourselves. While seated our own body is welded to
+                -- the seat, so the car's parts touch us every frame; without this
+                -- guard those contacts fling the driver instead of the target.
+                local myCharacter = LocalPlayer.Character
+                if myCharacter and root:IsDescendantOf(myCharacter) then return end
+                local now = os.clock()
+                if now - (lastFling[root] or 0) < CarFling.Repeat then return end
+                lastFling[root] = now
+
+                -- Away from the car horizontally, with lift, so it arcs out
+                -- instead of grinding along the ground.
+                local away = root.Position - origin
+                away = Vector3.new(away.X, 0, away.Z)
+                if away.Magnitude < 0.01 then
+                    away = Vector3.new(math.random(-100, 100) / 100, 0, math.random(-100, 100) / 100)
+                end
+                away = away.Unit
+
+                local power = CarFling.Power
+                local spin = Vector3.new(
+                    math.random(-power, power),
+                    math.random(-power, power),
+                    math.random(-power, power))
+
+                -- Lighten it so the impulse actually moves it, and ragdoll a
+                -- player so their own movement input cannot fight the launch.
+                pcall(function()
+                    root.CustomPhysicalProperties = PhysicalProperties.new(0.01, 0.3, 0.5, 1, 1)
+                end)
+                local body = root.Parent
+                local humanoid = body and body:FindFirstChildOfClass("Humanoid")
+                if humanoid then
+                    pcall(function()
+                        humanoid.PlatformStand = true
+                        humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+                    end)
+                end
+
+                -- Hold the impulse for the repeat window: a single frame is
+                -- usually reconciled away by the owner's next physics step.
+                task.spawn(function()
+                    local stopAt = os.clock() + CarFling.Repeat
+                    while os.clock() < stopAt and root.Parent do
+                        root.AssemblyLinearVelocity = away * power + Vector3.new(0, power * CarFling.Lift, 0)
+                        root.AssemblyAngularVelocity = spin
+                        task.wait()
+                    end
+                end)
+
+                -- If it is a car, fling whoever is inside it too: the chassis of
+                -- someone else's car may be owned by their driver, but the
+                -- occupants are still worth launching so the hit always lands.
+                -- VehicleSeat is a sibling of Seat, not a subclass, so both are
+                -- checked.
+                if body and body:IsA("Model") then
+                    for _, d in ipairs(body:GetDescendants()) do
+                        if d:IsA("Seat") or d:IsA("VehicleSeat") then
+                            local occupant = d.Occupant
+                            local occupantRoot = occupant and occupant.Parent
+                                and occupant.Parent:FindFirstChild("HumanoidRootPart")
+                            if occupantRoot and occupantRoot ~= root then
+                                flingRoot(occupantRoot, origin)
+                            end
+                        end
+                    end
+                end
+            end
+
+            local function onTouch(hit)
+                if not CarFling.Enabled or not hit then return end
+                local seat = seatedSeat()
+                if not seat then return end
+                -- Ignore contacts with our own body: the car touches us every
+                -- frame while we drive, and we would otherwise fling ourselves.
+                local myCharacter = LocalPlayer.Character
+                if myCharacter and hit:IsDescendantOf(myCharacter) then return end
+                -- Ignore our own car.
+                local vehicle = seat:FindFirstAncestorOfClass("Model") or seat.Parent
+                if vehicle and hit:IsDescendantOf(vehicle) then return end
+                local root = hit.AssemblyRootPart or hit
+                if root == seat.AssemblyRootPart then return end
+
+                -- Only players and cars are flung. Anything else (the floor, a
+                -- wall, a prop) is ignored: a wall's parent is workspace, and
+                -- walking that looking for seats would be ruinous.
+                local model = hit:FindFirstAncestorOfClass("Model")
+                local isPlayer = model ~= nil and Players:GetPlayerFromCharacter(model) ~= nil
+                local isCar = false
+                if model and not isPlayer then
+                    isCar = model:FindFirstChildOfClass("VehicleSeat") ~= nil
+                        or model:FindFirstChildOfClass("Seat") ~= nil
+                end
+                if not (isPlayer or isCar) then return end
+
+                flingRoot(root, seat.Position)
+            end
+
+            local function armPart(part)
+                if part:IsA("BasePart") and not boundParts[part] then
+                    boundParts[part] = true
+                    part.Touched:Connect(onTouch)
+                end
+            end
+
+            -- Bind once per vehicle, and again if the model streams more parts in.
+            local function bindVehicle(seat)
+                local model = seat and (seat:FindFirstAncestorOfClass("Model") or seat.Parent)
+                if not model then return end
+                if model ~= boundModel then
+                    boundModel = model
+                    for _, part in ipairs(model:GetDescendants()) do armPart(part) end
+                end
+                if not boundModels[model] then
+                    boundModels[model] = true
+                    model.DescendantAdded:Connect(armPart)
+                end
+            end
+
+            local function watchHumanoid(humanoid)
+                if not humanoid then return end
+                humanoid:GetPropertyChangedSignal("SeatPart"):Connect(function()
+                    if humanoid.SeatPart then bindVehicle(humanoid.SeatPart) end
+                end)
+                if humanoid.SeatPart then bindVehicle(humanoid.SeatPart) end
+            end
+
+            local function watchCharacter(character)
+                if not character then return end
+                local humanoid = character:FindFirstChildOfClass("Humanoid")
+                if humanoid then
+                    watchHumanoid(humanoid)
+                else
+                    character.ChildAdded:Connect(function(child)
+                        if child:IsA("Humanoid") then watchHumanoid(child) end
+                    end)
+                end
+            end
+
+            watchCharacter(LocalPlayer.Character)
+            LocalPlayer.CharacterAdded:Connect(watchCharacter)
+
+            Sections.movement:Toggle({
+                Name = 'car fling';
+                Flag = 'carfling';
+                Default = false;
+                Callback = function(v) CarFling.Enabled = v end
+            })
+
+            Sections.movement:Slider({
+                Name = 'car fling power';
+                Flag = 'carflingpower';
+                Min = 100; Max = 5000; Default = 1500; Decimals = 50;
+                Callback = function(v) CarFling.Power = v end
+            })
+
+            Sections.movement:Slider({
+                Name = 'car fling lift';
+                Flag = 'carflinglift';
+                Min = 0; Max = 2; Default = 0.7; Decimals = 0.05;
+                Callback = function(v) CarFling.Lift = v end
+            })
+
+            Sections.movement:Slider({
+                Name = 'car fling repeat (s)';
+                Flag = 'carflingrepeat';
+                Min = 0.05; Max = 1; Default = 0.1; Decimals = 0.05;
+                Callback = function(v) CarFling.Repeat = v end
+            })
+        end
+        --#endregion
+
         local SoundNames = {}
 
         for Name in sounds do
@@ -7743,8 +8205,6 @@ end
             ChamsRainbowSpeed = 0.2,
             ChamsMaterial = "Neon",
             ChamsTransparency = 0,
-            MuzzleFlash = true,
-            MuzzleColor = Color3.fromRGB(255, 196, 96),
         }
 
         local ChamsMaterials = { "Neon", "ForceField", "Glass", "Solid" }
@@ -7764,10 +8224,6 @@ end
         local spinAngle = 0
         local lastBase
         local MuzzleLocal
-        -- Forward-declared so the RenderStepped loop (defined below) can drive
-        -- muzzle-flash animation even though the flash code sits further down.
-        local activeFlashes = {}
-        local updateFlashes
 
         -- Rotate a part so its local "axis" points along "d".
         local function alignAxis(localAxis, d)
@@ -8094,8 +8550,6 @@ end
         end
 
         RunService.RenderStepped:Connect(function(dt)
-            -- Keep muzzle-flash pops alive even if the model is toggled off.
-            if #activeFlashes > 0 then updateFlashes(os.clock()) end
             local gun = ViewModel.Enabled and equippedGun() or nil
             if gun then
                 lastGunAt = os.clock()
@@ -8174,174 +8628,26 @@ end
             end
         end)
 
-        -- Muzzle flash: a bright core pop, a spray of forward embers and a short
-        -- light flash right at the barrel. Rigs are pooled so high fire rates do
-        -- not churn instances; each is returned once its particles have died.
-        local flashPool = {}
-        local FLASH_POOL_LIMIT = 16
 
-        local function newFlashRig()
-            local core = Instance.new("Part")
-            core.Name = "ViewModelMuzzleFX"
-            core.Anchored, core.CanCollide, core.CanQuery, core.CanTouch = true, false, false, false
-            core.CastShadow = false
-            core.Material = Enum.Material.Neon
-            core.Shape = Enum.PartType.Ball
-            core.Size = Vector3.new(0.1, 0.1, 0.1)
-            core.Transparency = 1
-            core.Parent = workspace
-
-            local attachment = Instance.new("Attachment")
-            attachment.Parent = core
-
-            local light = Instance.new("PointLight")
-            light.Range = 12
-            light.Brightness = 0
-            light.Parent = core
-
-            -- Soft core bloom: a very short, bright puff of light.
-            local bloom = Instance.new("ParticleEmitter")
-            bloom.Texture = "rbxasset://textures/particles/sparkles_main.dds"
-            bloom.LightEmission = 1
-            bloom.LightInfluence = 0
-            bloom.Rate = 0
-            bloom.Lifetime = NumberRange.new(0.05, 0.09)
-            bloom.Speed = NumberRange.new(1, 3)
-            bloom.SpreadAngle = Vector2.new(24, 24)
-            bloom.Size = NumberSequence.new({
-                NumberSequenceKeypoint.new(0, 0.9),
-                NumberSequenceKeypoint.new(1, 0),
-            })
-            bloom.Transparency = NumberSequence.new({
-                NumberSequenceKeypoint.new(0, 0.1),
-                NumberSequenceKeypoint.new(1, 1),
-            })
-            bloom.Parent = attachment
-
-            -- Embers thrown forward down the barrel.
-            local sparks = Instance.new("ParticleEmitter")
-            sparks.Texture = "rbxasset://textures/particles/sparkles_main.dds"
-            sparks.LightEmission = 1
-            sparks.LightInfluence = 0
-            sparks.Rate = 0
-            sparks.EmissionDirection = Enum.NormalId.Front
-            sparks.Lifetime = NumberRange.new(0.14, 0.28)
-            sparks.Speed = NumberRange.new(18, 34)
-            sparks.SpreadAngle = Vector2.new(5, 5)
-            sparks.Drag = 5
-            sparks.Acceleration = Vector3.new(0, -35, 0)
-            sparks.Size = NumberSequence.new({
-                NumberSequenceKeypoint.new(0, 0.2),
-                NumberSequenceKeypoint.new(1, 0),
-            })
-            sparks.Transparency = NumberSequence.new({
-                NumberSequenceKeypoint.new(0, 0.05),
-                NumberSequenceKeypoint.new(0.5, 0.35),
-                NumberSequenceKeypoint.new(1, 1),
-            })
-            sparks.Parent = attachment
-
-            return { core = core, light = light, bloom = bloom, sparks = sparks }
-        end
-
-        local function takeFlashRig()
-            while true do
-                local rig = table.remove(flashPool)
-                if not rig then return newFlashRig() end
-                if rig.core then
-                    rig.core.Parent = workspace
-                    return rig
-                end
+        -- The barrel's world CFrame while the view model is drawn, else nil. The
+        -- snap line reads this (through the ViewModelMuzzle forward declaration)
+        -- to start at the gun barrel instead of the crosshair.
+        local function currentMuzzle()
+            if ViewModel.Enabled and model and activeTool and lastBase then
+                return lastBase * CFrame.new(MuzzleLocal or Vector3.new(0, 0, -1))
             end
+            return nil
         end
-
-        local function releaseFlashRig(rig)
-            if not rig.core then return end
-            rig.core.Parent = nil
-            if #flashPool < FLASH_POOL_LIMIT then
-                table.insert(flashPool, rig)
-            else
-                rig.core:Destroy()
-            end
-        end
-
-        -- Per-shot core animation is driven by one shared update pass (the
-        -- RenderStepped loop below) instead of a thread per shot, and the colour
-        -- sequences are cached until the muzzle colour actually changes.
-        local flashSeqSource
-        local flashSeqBloom
-        local flashSeqSpark
-
-        local function flashSequences(color)
-            if flashSeqSource ~= color then
-                flashSeqSource = color
-                flashSeqBloom = ColorSequence.new(color:Lerp(Color3.new(1, 1, 1), 0.7))
-                flashSeqSpark = ColorSequence.new(color)
-            end
-            return flashSeqBloom, flashSeqSpark
-        end
-
-        local FLASH_POP = 0.08      -- core pop time
-        local FLASH_LIFE = 0.35     -- reserve the rig until the embers are gone
-
-        updateFlashes = function(now)
-            local i = 1
-            while i <= #activeFlashes do
-                local entry = activeFlashes[i]
-                local rig = entry.rig
-                local elapsed = now - entry.start
-                if elapsed >= FLASH_LIFE then
-                    rig.core.Transparency = 1
-                    rig.core.Size = Vector3.new(0.1, 0.1, 0.1)
-                    rig.light.Brightness = 0
-                    releaseFlashRig(rig)
-                    table.remove(activeFlashes, i)
-                else
-                    if elapsed < FLASH_POP then
-                        local alpha = elapsed / FLASH_POP
-                        local scale = 0.42 + 0.5 * alpha
-                        rig.core.Size = Vector3.new(scale, scale, scale)
-                        rig.core.Transparency = 0.05 + 0.95 * alpha
-                        rig.light.Brightness = 6 * (1 - alpha)
-                    end
-                    i += 1
-                end
-            end
-        end
-
-        local function spawnMuzzleFlash(cf)
-            local rig = takeFlashRig()
-            local color = ViewModel.MuzzleColor
-            local bloomSeq, sparkSeq = flashSequences(color)
-
-            rig.core.CFrame = cf
-            rig.core.Color = color
-            rig.core.Size = Vector3.new(0.42, 0.42, 0.42)
-            rig.core.Transparency = 0.05
-
-            rig.light.Color = color
-            rig.light.Brightness = 6
-
-            rig.bloom.Color = bloomSeq
-            rig.sparks.Color = sparkSeq
-
-            rig.bloom:Emit(2)
-            rig.sparks:Emit(math.random(7, 12))
-
-            activeFlashes[#activeFlashes + 1] = { rig = rig, start = os.clock() }
-        end
+        ViewModelMuzzle = currentMuzzle
 
         -- Called from the shot paths (see the forward declaration near the top of
-        -- the file). Draws the muzzle flash at the view model's barrel and, when
-        -- tracers are on, a tracer that starts at that muzzle. Falls back to the
-        -- plain head tracer when the view model is off.
+        -- the file). Starts the tracer at the view model's barrel when the view
+        -- model is on, falling back to the plain head origin otherwise. The muzzle
+        -- flash is deliberately not drawn here - see the "remove muzzle flash"
+        -- feature further down.
         ViewModelShot = function(hitPoint, fallbackOrigin)
-            local muzzle
-            if ViewModel.Enabled and model and activeTool and lastBase then
-                muzzle = lastBase * CFrame.new(MuzzleLocal or Vector3.new(0, 0, -1))
-            end
+            local muzzle = currentMuzzle()
             if muzzle then
-                if ViewModel.MuzzleFlash then spawnMuzzleFlash(muzzle) end
                 if TracerEnabled and typeof(hitPoint) == "Vector3" then
                     CreateTracer(muzzle.Position, hitPoint, Vector3.zero)
                 end
@@ -8354,16 +8660,6 @@ end
             Name = "custom view model"; Flag = "viewmodel"; Default = false;
             Callback = function(v)
                 ViewModel.Enabled = v
-                -- Pre-warm the flash pool so the first shots do not pay for
-                -- instance creation mid-fire.
-                if v then
-                    for _ = 1, 4 do
-                        if #flashPool >= 4 then break end
-                        local rig = newFlashRig()
-                        rig.core.Parent = nil
-                        table.insert(flashPool, rig)
-                    end
-                end
             end
         })
         Sections.visuals:Toggle({
@@ -8414,15 +8710,6 @@ end
             Callback = function(v) ViewModel.BobAmount = v end
         })
         Sections.visuals:Toggle({
-            Name = "view model muzzle flash"; Flag = "viewmodelmuzzle"; Default = true;
-            Callback = function(v) ViewModel.MuzzleFlash = v end
-        })
-        Sections.visuals:Label({Name = "view model muzzle color"}):Colorpicker({
-            Name = "view model muzzle color"; Flag = "viewmodelmuzzlecolor";
-            Default = ViewModel.MuzzleColor;
-            Callback = function(v) ViewModel.MuzzleColor = v end
-        })
-        Sections.visuals:Toggle({
             Name = "view model chams"; Flag = "viewmodelchams"; Default = false;
             Callback = function(v)
                 ViewModel.Chams = v
@@ -8451,6 +8738,112 @@ end
         Sections.visuals:Slider({
             Name = "view model chams transparency"; Flag = "viewmodelchamstrans"; Min = 0; Max = 1; Default = 0; Decimals = 0.05;
             Callback = function(v) ViewModel.ChamsTransparency = v end
+        })
+    end
+    --#endregion
+
+
+    --#region muzzle flash removal
+    -- Strips the game's own muzzle flash from your equipped gun, client-side.
+    -- There is no single documented instance name, so it works by behaviour: on
+    -- a gun, any Light is kept off, and any part / emitter whose name contains
+    -- "muzzle", "flash" or "blast" is hidden. The few relevant properties are
+    -- watched so a flash the game turns on per shot is killed the instant it
+    -- happens instead of waiting for a poll. Nothing here replicates - it
+    -- changes only what you see.
+    do
+        local MuzzleScrub = { Enabled = true }
+        local WORDS = { "muzzle", "flash", "blast" }
+        local watched = WeakKeyedTable()
+
+        local function looksLikeMuzzle(name)
+            local lower = string.lower(name)
+            for _, word in ipairs(WORDS) do
+                if string.find(lower, word, 1, true) then return true end
+            end
+            return false
+        end
+
+        local function watch(inst, prop, enforce)
+            if watched[inst] then return end
+            watched[inst] = true
+            inst:GetPropertyChangedSignal(prop):Connect(function()
+                if MuzzleScrub.Enabled then enforce() end
+            end)
+        end
+
+        local function scrub(inst, isGun)
+            if not MuzzleScrub.Enabled then return end
+            if inst:IsA("Light") then
+                -- Only lights on guns are muzzle flashes; a light on any other
+                -- tool is left alone.
+                if not isGun then return end
+                inst.Enabled = false
+                watch(inst, "Enabled", function() inst.Enabled = false end)
+            elseif inst:IsA("BasePart") and looksLikeMuzzle(inst.Name) then
+                inst.Transparency = 1
+                inst.CanQuery = false
+                inst.CanTouch = false
+                watch(inst, "Transparency", function()
+                    if inst.Transparency < 1 then inst.Transparency = 1 end
+                end)
+            elseif inst:IsA("ParticleEmitter") and looksLikeMuzzle(inst.Name) then
+                inst.Enabled = false
+                watch(inst, "Enabled", function() inst.Enabled = false end)
+            elseif (inst:IsA("Beam") or inst:IsA("Trail")) and looksLikeMuzzle(inst.Name) then
+                inst.Enabled = false
+                watch(inst, "Enabled", function() inst.Enabled = false end)
+            end
+        end
+
+        local function scrubTool(tool)
+            if not tool or not tool:IsA("Tool") then return end
+            local isGun = tool:GetAttribute("ToolType") == "Gun"
+            scrub(tool, isGun)
+            for _, d in ipairs(tool:GetDescendants()) do scrub(d, isGun) end
+            if not watched[tool] then
+                watched[tool] = true
+                tool.DescendantAdded:Connect(function(d) scrub(d, isGun) end)
+            end
+        end
+
+        local function equippedTool()
+            local character = LocalPlayer.Character
+            return character and character:FindFirstChildOfClass("Tool")
+        end
+
+        local function rearm()
+            scrubTool(equippedTool())
+        end
+
+        local function bindCharacter(character)
+            if not character then return end
+            character.ChildAdded:Connect(function(child)
+                if child:IsA("Tool") then scrubTool(child) end
+            end)
+        end
+
+        bindCharacter(LocalPlayer.Character)
+        LocalPlayer.CharacterAdded:Connect(bindCharacter)
+
+        -- Fallback re-arm: covers a gun already equipped at load time and any
+        -- path that does not raise ChildAdded (for example the tool type
+        -- attribute being set a moment after the tool is parented).
+        task.spawn(function()
+            while true do
+                task.wait(0.5)
+                if MuzzleScrub.Enabled then rearm() end
+            end
+        end)
+
+        Sections.visuals:Toggle({
+            Name = "remove muzzle flash";
+            Flag = "nomuzzle";
+            Default = true;
+            Callback = function(v)
+                MuzzleScrub.Enabled = v
+                if v then rearm() end
+            end
         })
     end
     --#endregion
