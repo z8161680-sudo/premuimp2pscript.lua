@@ -21,6 +21,67 @@
 
 
 
+--#region re-execute guard
+    -- Running the script again used to leave the previous instance alive: its
+    -- connections, function hooks and while-true loops all stayed, so every run
+    -- stacked another set on top. That piles up per-frame work and, worse,
+    -- nests function hooks - which is what eventually overflowed the C stack.
+    -- This registry tears the previous instance down before the new one starts.
+    local NHGuard = (function()
+        local env = (type(getgenv) == "function" and getgenv()) or _G
+        local prev = env.__negrohax
+        if prev then
+            if type(prev.teardown) == "function" then pcall(prev.teardown) end
+            -- Stop the old loops even if its teardown failed partway.
+            prev.gen = (prev.gen or 0) + 1
+        end
+        local g = {
+            gen = (prev and prev.gen or 0) + 1,
+            conns = {},
+            hooks = {},
+        }
+        env.__negrohax = g
+
+        function g.teardown()
+            g.gen += 1
+            for i = #g.conns, 1, -1 do
+                pcall(function() g.conns[i]:Disconnect() end)
+            end
+            table.clear(g.conns)
+            for i = #g.hooks, 1, -1 do
+                pcall(restorefunction, g.hooks[i])
+            end
+            table.clear(g.hooks)
+        end
+
+        -- Every connection and hook we create goes through here, so teardown
+        -- can undo exactly ours and nothing else.
+        function g.conn(signal, fn)
+            local connection = signal:Connect(fn)
+            g.conns[#g.conns + 1] = connection
+            return connection
+        end
+
+        function g.hook(target, fn)
+            local original = hookfunction(target, fn)
+            g.hooks[#g.hooks + 1] = target
+            return original
+        end
+
+        -- While-true loops capture their generation and stop when it changes.
+        function g.alive(gen)
+            return g.gen == gen
+        end
+
+        return g
+    end)()
+
+    print("[negrohax] guard ready gen=" .. tostring(NHGuard.gen))
+
+--#endregion
+
+
+
 --#region defs
 
     local Camera = workspace.CurrentCamera
@@ -44,44 +105,7 @@
     local _cheatinfo = {
         autofireconnection = nil;
         offset = Vector3.new(0, 0, 0);
-        didmanip = false;
         target = nil;
-        manip_corners = {
-            Vector3.new(0, 0, 0), --center
-            Vector3.new(0, 0, 1), --front
-            Vector3.new(0, 0, -1), --back
-            
-            Vector3.new(0, 1, 0), -- up
-            Vector3.new(0, 1, 1), -- up front
-            Vector3.new(0, 1, -1), -- up back
-            
-            
-            Vector3.new(0, -1, 0), -- down
-            Vector3.new(-1, 0, 0), -- left
-            Vector3.new(1, 0, 0), --right
-            Vector3.new(-1, 1, 0), -- top lef
-            Vector3.new(1, 1, 0), -- top right
-            Vector3.new(-1, -1, 0), -- bottom left
-            Vector3.new(1, -1, 0), -- bottom right
-        };
-        box_corners = {
-            Vector3.new(-1, -1, -1);
-            Vector3.new(1, -1, -1);
-            Vector3.new(1, 1, -1);
-            Vector3.new(-1, 1, -1);
-            Vector3.new(-1, -1, 1);
-            Vector3.new(1, -1, 1);
-            Vector3.new(1, 1, 1);
-            Vector3.new(-1, 1, 1);
-        };
-        box_faces = {
-            -- top
-            {1,2}, {2,3}, {3,4}, {4,1},
-            -- bottom
-            {5,6}, {6,7}, {7,8}, {8,5},
-            -- poles/sides/stick whatever
-            {1,5}, {2,6}, {3,7}, {4,8}
-        };
     }
 
     --#region hitsounds
@@ -184,7 +208,7 @@
                 marker.Kill = kill == true
             end
 
-            RunService.RenderStepped:Connect(function(dt)
+            NHGuard.conn(RunService.RenderStepped, function(dt)
                 local step = math.clamp(dt or 0.016, 0, 0.1)
                 for _, marker in ipairs(pool) do
                     if marker.Active then
@@ -270,7 +294,7 @@
 
             local LastHealth = Humanoid.Health
 
-            Humanoid.HealthChanged:Connect(function(Health)
+            NHGuard.conn(Humanoid.HealthChanged, function(Health)
                 local Shot = ShotAt[Character]
 
                 if Health < LastHealth and Shot and os.clock() - Shot.t < 0.5 then
@@ -315,14 +339,14 @@
                 task.spawn(HookCharacter, plr.Character)
             end
 
-            plr.CharacterAdded:Connect(HookCharacter)
+            NHGuard.conn(plr.CharacterAdded, HookCharacter)
         end
 
         for _, plr in Players:GetPlayers() do
             HookPlayer(plr)
         end
 
-        Players.PlayerAdded:Connect(HookPlayer)
+        NHGuard.conn(Players.PlayerAdded, HookPlayer)
 
     --#endregion
 
@@ -441,7 +465,7 @@ local AggroThreatRange = 80
 
 -- Player filter (see the "player filter" dropdowns in the aimbot section):
 -- whitelisted names are ignored by every combat feature (silent aim,
--- ragebot, peek resolver, chams, hitbox hulls) while ESP still draws them;
+-- ragebot, chams, hitbox hulls) while ESP still draws them;
 -- blacklisted names are forced to the top of every targeting pass, with
 -- everyone else still available when they are dead / gone.
 local WhitelistedPlayers = {}
@@ -752,7 +776,7 @@ local function _ShotOrigin(head)
 end
 
 -- Rays must ignore the local AA visual copy: it sits at the real position and
--- used to block our own silent-aim, hitscan and manipulation casts.
+-- used to block our own silent-aim casts.
 --
 -- This used to scan workspace and allocate a new table for every single ray,
 -- which is the hottest path in the script (every scan sample, every probe, every
@@ -859,6 +883,113 @@ function HitboxExpander.Probe(player, origin)
     HitboxExpander.Cache[player] = { point = bestPoint, part = bestPart, time = now }
     return bestPoint, bestPart
 end
+
+--#region origin manip
+-- Origin manipulation, ported from the older build. A covered target cannot be
+-- hit from the head, so the shot origin is nudged until a ray from the nudged
+-- origin reaches the target, and the shot is fired from there. Only the origin
+-- sent with the shot moves - the client body, camera and pose never do. The
+-- server validates the shot against the origin it receives, so this is what
+-- actually opens a blocked line (wallpen only asks the server to ignore it).
+local Manip = {
+    Enabled = false,
+    Dist = 10,     -- furthest the origin may be nudged (studs)
+    Samples = 20,  -- sphere samples per search (the older build's scan count)
+    -- Short-lived result cache: silent aim, the namecall rewrite and the
+    -- ragebot all ask about the same target inside one frame, and the search
+    -- below is a lot of rays.
+    Cache = setmetatable({}, { __mode = "k" }),
+}
+Manip.Params = RaycastParams.new()
+Manip.Params.FilterType = Enum.RaycastFilterType.Exclude
+Manip.Params.IgnoreWater = true
+
+-- Returns the offset that gives a clear line to `target`, or nil when the
+-- target stays covered at every nudge. `ignoreZero` skips the untouched-origin
+-- case, which the caller has normally already checked.
+--
+-- The sample set is a Fibonacci sphere: an even spread of directions with the
+-- distances interleaved, so small and large nudges are both tried and the
+-- shortest one that works wins. An offset is only accepted when the path from
+-- the real origin out to the nudged origin is itself clear - a nudge that has
+-- to cross a wall is not a nudge, and the server would reject that shot.
+function Manip.FindOffset(target, origin, ignoreZero)
+    if not target or not target.Parent or typeof(origin) ~= "Vector3" then return nil end
+    local model = target:FindFirstAncestorOfClass("Model")
+    if not model then return nil end
+    local aimpos = target.Position
+    local now = os.clock()
+    local cached = Manip.Cache[target]
+    if cached and now - cached.time < 0.08
+        and math.abs(cached.x - origin.X) < 0.1
+        and math.abs(cached.y - origin.Y) < 0.1
+        and math.abs(cached.z - origin.Z) < 0.1 then
+        return cached.offset, cached.part
+    end
+    local params = Manip.Params
+    params.FilterDescendantsInstances = AAIgnoreList()
+    local function store(offset, hitPart)
+        Manip.Cache[target] = { x = origin.X, y = origin.Y, z = origin.Z,
+            time = now, offset = offset, part = hitPart }
+        return offset, hitPart
+    end
+
+    -- A nudge is valid only when the segment from the real origin out to the
+    -- nudged origin is clear, and the line from there reaches the target. The
+    -- part the line lands on is returned, so the shot can be aimed at it: a
+    -- nudge can open up the shoulder where the head stays covered.
+    local function test(offset)
+        if not target.Parent then return nil end
+        if offset.Magnitude > 0.001
+            and workspace:Raycast(origin, offset, params) then
+            return nil
+        end
+        local start = origin + offset
+        local direction = aimpos - start
+        if direction.Magnitude < 0.001 then return nil end
+        local hit = workspace:Raycast(start, direction, params)
+        if hit and hit.Instance and hit.Instance:IsDescendantOf(model) then
+            return hit.Instance
+        end
+        return nil
+    end
+
+    -- Untouched origin first, unless the caller already knows it is covered.
+    if not ignoreZero then
+        local hit = test(Vector3.zero)
+        if hit then return store(Vector3.zero, hit) end
+    end
+
+    local count = math.clamp(math.floor(Manip.Samples), 1, 40)
+    local maxdist = math.max(Manip.Dist, 0.01)
+    local bestOffset, bestHit, bestLength = nil, nil, math.huge
+    local golden = math.pi * (3 - math.sqrt(5))
+    for i = 1, count do
+        local y = 1 - 2 * ((i - 0.5) / count)
+        local radial = math.sqrt(math.max(0, 1 - y * y))
+        local angle = i * golden
+        -- Interleave distances so small and large offsets are both tested.
+        local fraction = (((i * 37) % count) + 1) / count
+        local length = maxdist * fraction
+        if length < bestLength then
+            local offset = Vector3.new(math.cos(angle) * radial, y,
+                math.sin(angle) * radial) * length
+            local hit = test(offset)
+            if hit then
+                bestOffset, bestHit, bestLength = offset, hit, length
+            end
+        end
+    end
+    return store(bestOffset, bestHit)
+end
+
+-- How close cover may start before a wallpen reading from that origin is
+-- treated as unreliable. Inside this gap the origin is pressed against, or
+-- sitting in, geometry (tree foliage, a doorframe, a wall corner), so the
+-- "thin wall" reading there is usually wrong and the bullet dies in the cover.
+-- The aim prefers a shifted clear origin (manip) in that case.
+local MANIP_CLOSE_COVER = 6
+--#endregion
 
 --#region wall penetration (local prediction only)
 -- Replaces the old one-ray check. The old check measured from the target point
@@ -1179,6 +1310,32 @@ end
 -- Written by the aim toggles so the panel can show readiness even with no target.
 local AimState = { Silent = false, Ragebot = false, Origin = nil }
 
+-- Wallbang and origin manip are two answers to the same question ("the target
+-- is covered - how do I still land the shot?"), so they share one switch. This
+-- is the order they are tried in, set by the "blocked shot order" dropdown:
+--   "Auto (manip in cover)" - manip first only when the cover starts at the
+--                             head (trees, tight corners), else wallbang.
+--   "Wallbang first"        - wallbang on every blocked shot, manip falls back.
+--   "Manip first"           - shifted origin on every blocked shot, wallbang
+--                             falls back.
+--   "Wallbang only"         - manip is not used at all.
+--   "Manip only"            - wallbang is not used at all.
+local BLOCKED_ORDER_ITEMS = {
+    "Auto (manip in cover)", "Wallbang first", "Manip first",
+    "Wallbang only", "Manip only",
+}
+local BlockedOrder = "Auto (manip in cover)"
+local BlockedEnabled = false
+
+-- Applies the master switch and the chosen order to the two paths. Called on
+-- load and whenever either control changes.
+local function ApplyBlockedMode()
+    local on = BlockedEnabled
+    WallPen.Enabled = on and BlockedOrder ~= "Manip only"
+    Manip.Enabled = on and BlockedOrder ~= "Wallbang only"
+    table.clear(Manip.Cache)
+end
+
 -- Target panel. Resolver labels describe heuristics, not proof of cheating.
 do
     local old = LocalPlayer.PlayerGui:FindFirstChild("TargetingPanel")
@@ -1252,7 +1409,7 @@ do
         return text
     end
 
-    RunService.RenderStepped:Connect(function()
+    NHGuard.conn(RunService.RenderStepped, function()
         local armed = AimState.Silent or AimState.Ragebot
         local p = CurrentTargetPlayer
         local c = p and p.Character
@@ -1350,8 +1507,6 @@ do -- combat
     local SilentAimEnabled = false; 
     local _NoSpreadEnabled = false;
     local MaxAimCandidates = 8;
-    local HitScanEnabled = false;
-    local HitScanCount = 32;
     -- Failsafe: the only thing allowed to interrupt UG. Shots are fired from
     -- the pose the server holds; if a streak of them stops registering, the
     -- displacement is dropped completely for a few seconds (plain valid shots
@@ -1441,8 +1596,7 @@ do -- combat
     --#region tracers
 
             -- Animated tracer: the head travels from muzzle to the resolved
-            -- point at TracerSpeed. The midpoint is pushed along the manip
-            -- offset so the curve shows how the shot was bent. Purely visual.
+            -- point at TracerSpeed. Purely visual.
             local function samplePath(path, travelled)
                 for i = 1, #path - 1 do
                     local from, to = path[i], path[i + 1]
@@ -1709,409 +1863,6 @@ do -- combat
 
     --#endregion
 
-    --#region manip
-        -- Origin manipulation: find the smallest point inside a sphere of
-        -- `manip dist` studs around our own head - straight up, straight
-        -- sideways, or anywhere between - that can land a shot on the target.
-        -- The shot is then fired from the SERVER-held pose moved to that point
-        -- (see FireManipShot): the server validates every shot against the pose
-        -- it holds, so only the server copy is moved and the client body /
-        -- camera never move. That is what lets a shot leave from around or over
-        -- cover the straight line cannot clear, while the server still sees a
-        -- bullet from a pose the character can plausibly occupy.
-        --
-        -- Spots the target's own head cannot see are preferred (their aimbot
-        -- cannot lock on), and the shot lands on a clear line to any body part
-        -- or through cover within the wallpen budget; only when no hidden spot
-        -- exists does it fall back to an exposed clear-line spot. A found spot
-        -- is reused for a burst of shots and only re-rolled on a timer, so
-        -- consecutive shots leave from the same origin (consistent) while the
-        -- spot still drifts over time so it cannot be pre-aimed; the
-        -- through-cover tier is kept only while it is actually landing (see
-        -- ManipWallResult) - no toggle needed.
-        local Manip = {
-            Enabled = false,
-            Max = 20,     -- furthest the origin may move (dist slider, 0-20)
-            Scan = 12,    -- angles tried per ring (scan slider, CPU knob)
-            Rings = 12,   -- evenly spaced distance steps between ~1 stud and Max
-        }
-
-        local manipParams = RaycastParams.new()
-        manipParams.FilterType = Enum.RaycastFilterType.Exclude
-        manipParams.IgnoreWater = true
-        pcall(function() manipParams.CollisionGroup = "ClientBullet" end)
-
-        local manipOverlap = OverlapParams.new()
-        manipOverlap.FilterType = Enum.RaycastFilterType.Exclude
-        manipOverlap.MaxParts = 8
-
-        -- Open-air test. A ray cast from inside a part reports no hit, so the
-        -- only way to reject an origin buried in the wall is an overlap query
-        -- around the candidate point.
-        local function ManipFree(point)
-            manipOverlap.FilterDescendantsInstances = AAIgnoreList()
-            local ok, parts = pcall(function()
-                return workspace:GetPartBoundsInRadius(point, 0.5, manipOverlap)
-            end)
-            if not ok or not parts then return true end
-            for _, part in ipairs(parts) do
-                if part:IsA("BasePart") and part.CanCollide and part.Transparency < 0.95 then
-                    return false
-                end
-            end
-            return true
-        end
-
-        -- Does a shot from `from` actually reach the target's body? Only the
-        -- first hit counts: a descendant of the target's model means the line is
-        -- real, anything else is cover.
-        local function ManipReaches(from, aim, model)
-            manipParams.FilterDescendantsInstances = AAIgnoreList()
-            local delta = aim - from
-            local distance = delta.Magnitude
-            if distance < 0.001 then return nil end
-            local hit = workspace:Raycast(from, delta + delta.Unit * 0.02, manipParams)
-            if hit and hit.Instance and hit.Instance:IsDescendantOf(model) then
-                return hit.Instance, hit.Position
-            end
-            return nil
-        end
-
-        -- Hidden = the target's own head cannot see the spot: every eye-height
-        -- ray is blocked by cover, so their aimbot's visibility check fails and
-        -- it cannot lock while the server pose stands there. The target's body
-        -- and our own ignore list are filtered out. Same rule the old peek
-        -- resolver used for its safe spots.
-        local manipHideParams = RaycastParams.new()
-        manipHideParams.FilterType = Enum.RaycastFilterType.Exclude
-        manipHideParams.IgnoreWater = true
-        pcall(function() manipHideParams.CollisionGroup = "ClientBullet" end)
-
-        -- Reused filter table: the target model is appended to the cached
-        -- AAIgnoreList() instead of cloning a fresh list for every ray.
-        local manipHideList, manipHideModel, manipHideBase, manipHideAt = {}, nil, nil, 0
-        local function ManipHideFilter(model)
-            local base = AAIgnoreList()
-            local now = os.clock()
-            if model ~= manipHideModel or base ~= manipHideBase
-                or base[1] ~= manipHideList[1] or now - manipHideAt > 0.5 then
-                table.clear(manipHideList)
-                for i = 1, #base do manipHideList[i] = base[i] end
-                if model then manipHideList[#manipHideList + 1] = model end
-                manipHideModel, manipHideBase, manipHideAt = model, base, now
-            end
-            return manipHideList
-        end
-
-        local function ManipHidden(spot, model)
-            local head = model and model:FindFirstChild("Head")
-            if not head then return false end
-            manipHideParams.FilterDescendantsInstances = ManipHideFilter(model)
-            for _, lift in ipairs({ 0, 1.5, 3 }) do
-                local eye = head.Position + Vector3.new(0, lift, 0)
-                local delta = spot - eye
-                if delta.Magnitude > 0.5
-                    and not workspace:Raycast(eye, delta, manipHideParams) then
-                    return false
-                end
-            end
-            return true
-        end
-
-        -- Tier-2 (wallbang) hidden spots are only worth using while the server
-        -- is actually registering through-cover shots, which varies by gun and
-        -- by how the hit is validated. Auto mode watches the outcome of every
-        -- wallbang manip shot: a couple of misses in a row switch tier 2 off
-        -- for a moment (the search then uses clear-line spots), and the next
-        -- hit switches it back. It finds its own level instead of needing a
-        -- toggle.
-        local MANIP_WALL_MISSES = 2
-        local MANIP_WALL_RETRY = 5
-        local manipWallMisses = 0
-        local manipWallBlockUntil = 0
-        local function ManipWallAllowed()
-            return os.clock() >= manipWallBlockUntil
-        end
-        local function ManipWallResult(hit)
-            if hit then
-                manipWallMisses = 0
-                manipWallBlockUntil = 0
-            else
-                manipWallMisses = manipWallMisses + 1
-                if manipWallMisses >= MANIP_WALL_MISSES then
-                    manipWallMisses = 0
-                    manipWallBlockUntil = os.clock() + MANIP_WALL_RETRY
-                end
-            end
-        end
-
-        -- Can our shot actually land from `from`? A clear line to ANY part of
-        -- the rig counts (the head is usually the only thing the target's own
-        -- cover hides), and a measured wallbang on cover within budget counts
-        -- too - the same test EvaluateShot runs, kept light here because the
-        -- search tries many spots. The third result says whether the shot was a
-        -- clear line (`true`) or only a wallbang (`false`): a clear line is
-        -- preferred because the server always registers it.
-        local function ManipLands(from, model)
-            local wallPart, wallPos
-            for _, name in ipairs(RIG_PART_NAMES) do
-                local part = model:FindFirstChild(name)
-                if part and part:IsA("BasePart") then
-                    local hitPart, hitPos = ManipReaches(from, part.Position, model)
-                    if hitPart then return hitPart, hitPos, true end
-                    if WallPen.Enabled and ManipWallAllowed() and not wallPart then
-                        local trace = WallPen.Probe(part, from, part.Position, model)
-                        if trace.state == "clear" then
-                            wallPart, wallPos = trace.reached or part, part.Position
-                        elseif trace.state == "blocked"
-                            and WallPen.CanPenetrate(trace.thickness, trace.layers) then
-                            wallPart, wallPos = part, part.Position
-                        end
-                    end
-                end
-            end
-            if wallPart then return wallPart, wallPos, false end
-            return nil
-        end
-
-        -- The directions an origin may move in, cached because the shot paths
-        -- call this on every blocked shot. The six cardinal axes come first so
-        -- "20 studs straight up" (or straight sideways) is always reachable;
-        -- the rest are a Fibonacci sphere, which spreads evenly with no
-        -- clumping at the poles. Only rebuilt when the scan slider changes.
-        local manipDirs, manipDirsScan = nil, -1
-        local function ManipDirections(scan)
-            if manipDirs and manipDirsScan == scan then return manipDirs end
-            local dirs = {
-                Vector3.yAxis, -Vector3.yAxis,
-                Vector3.xAxis, -Vector3.xAxis,
-                Vector3.zAxis, -Vector3.zAxis,
-            }
-            local golden = math.pi * (3 - math.sqrt(5))
-            for i = 1, scan do
-                local y = 1 - 2 * ((i - 0.5) / scan)
-                local radial = math.sqrt(math.max(0, 1 - y * y))
-                local angle = i * golden
-                dirs[#dirs + 1] = Vector3.new(
-                    math.cos(angle) * radial, y, math.sin(angle) * radial)
-            end
-            manipDirs, manipDirsScan = dirs, scan
-            return dirs
-        end
-
-        -- Returns a shot plan (or nil) tagged with `manip = true`. The shot
-        -- paths branch on that tag and hand the plan to FireManipShot, which
-        -- moves the server pose onto `origin + plan.offset` before firing - the
-        -- offset is NOT added to the shot origin the way the other plans' are.
-        --
-        -- The search prefers a spot the target's own head cannot see (their
-        -- aimbot cannot lock) and only falls back to an exposed clear-line spot
-        -- when no hidden one exists. This is the heaviest probe in EvaluateShot
-        -- and the aim asks for it every frame, so the result is cached per
-        -- target for a moment. Several slots are kept because the same target is
-        -- asked about from two origins (the real and the server-held head)
-        -- inside one frame while anti-aim is displacing, and a single slot would
-        -- thrash between them and never hit.
-        -- All manip search state lives in one table. The block this sits in is
-        -- already near the -O0 register ceiling, so a dozen separate locals
-        -- here would push the unoptimised build over the limit.
-        local manipState = {
-            cache = setmetatable({}, { __mode = "k" }),
-            miss = setmetatable({}, { __mode = "k" }),
-            spin = setmetatable({}, { __mode = "k" }),
-            -- A found spot is reused for a burst of shots so consecutive manip
-            -- shots at the same target leave from the SAME origin. Re-searching
-            -- every frame picked a slightly different spot each time, which is
-            -- what made the feature feel erratic: one shot landed and the next
-            -- did not. FireManipShot re-validates the shot before firing, so a
-            -- stale spot can only cause a held shot, never an invalid one.
-            cacheTTL = 0.35,
-            cacheSlots = 3,
-            cacheReach = 1.5,
-            -- When nothing works, do not re-run the whole search every frame:
-            -- the answer barely changes in a few frames and the scan is the
-            -- heaviest probe in the aim, so a miss parks the target for a bit.
-            missTTL = 0.2,
-            -- Hidden candidates still have to be checked for a landing shot (a
-            -- ray per rig part, plus wallpens). That check is the expensive
-            -- part, so it is capped; past the cap the search only keeps what it
-            -- already found.
-            hiddenTries = 24,
-            -- Once a usable exposed spot exists the search keeps looking for a
-            -- hidden one only this much longer before taking the exposed spot.
-            -- Without the bound a blocked target scanned every candidate in
-            -- every ring on every frame - the biggest cost in the whole aim -
-            -- even though the exposed fallback was already good enough.
-            hiddenExtra = 36,
-            -- The direction the search starts from is re-rolled on a timer
-            -- instead of on every call: every search inside one window walks
-            -- the same order, so repeated shots pick the same spot, while the
-            -- spot still drifts over time so it cannot be pre-aimed.
-            spinTTL = 0.8,
-        }
-
-        local function ManipCacheLookup(target, origin)
-            local slots = manipState.cache[target]
-            if not slots then return false, nil, nil end
-            local now = os.clock()
-            for i = 1, #slots do
-                local slot = slots[i]
-                if now - slot.time < manipState.cacheTTL
-                    and (slot.origin - origin).Magnitude < manipState.cacheReach then
-                    return true, slot.plan, slots
-                end
-            end
-            return false, nil, slots
-        end
-
-        local function ManipPlan(target, origin)
-            if not Manip.Enabled then return nil end
-            local model = target and target:FindFirstAncestorOfClass("Model")
-            if not model or typeof(origin) ~= "Vector3" then return nil end
-            local part = model:FindFirstChild("Head") or target
-            if not part then return nil end
-            local aim = part.Position
-            local delta = aim - origin
-            if delta.Magnitude < 0.5 then return nil end
-
-            -- Keyed by the target's model, not the part: the aim asks about the
-            -- head while FireManipShot re-asks about the same model, and both
-            -- have to share one cached spot.
-            local found, cachedPlan, slots = ManipCacheLookup(model, origin)
-            if found then return cachedPlan end
-            local missAt = manipState.miss[model]
-            if missAt and os.clock() - missAt < manipState.missTTL then return nil end
-            local function finish(plan)
-                slots = slots or {}
-                slots[#slots + 1] = { origin = origin, time = os.clock(), plan = plan }
-                while #slots > manipState.cacheSlots do table.remove(slots, 1) end
-                manipState.cache[model] = slots
-                return plan
-            end
-
-            -- Straight shot already reaches the target: one raycast, nothing to
-            -- fix. This is the main performance guard, and it is NOT cached -
-            -- caching it would keep the manip off for a moment after the target
-            -- ducks behind cover.
-            if ManipReaches(origin, aim, model) then return nil end
-
-            local limit = math.clamp(Manip.Max, 0, 20)
-            if limit <= 0.1 then return nil end
-            local rings = math.clamp(math.floor(Manip.Rings), 1, 24)
-            local scan = math.clamp(math.floor(Manip.Scan), 4, 48)
-
-            -- Every direction out to `manip dist` studs, at EVENLY spaced radii
-            -- from ~1 stud to the maximum (e.g. 1, 2.7, 4.5 ... 20 with 12
-            -- steps). Even steps matter more than geometric ones here: the old
-            -- geometric set jumped straight from ~9.5 to 20, so a spot that
-            -- needed 12-15 studs was never tried and the manip looked like it
-            -- "did not reach far enough". The rings are still walked smallest
-            -- first, so the smallest shift that works still wins.
-            local dirs = ManipDirections(scan)
-            local dirCount = #dirs
-            local first = math.min(1, limit)
-            local step = rings > 1 and (limit - first) / (rings - 1) or 0
-
-            -- Stable per-target start point in the direction list: re-rolled on
-            -- a timer, not per call, so repeated shots walk the same order. The
-            -- radius order (smallest first) is unchanged, so the shift stays as
-            -- small as it can be.
-            local spin = manipState.spin[model]
-            local spinNow = os.clock()
-            if not spin or spinNow - spin.time > manipState.spinTTL then
-                spin = { index = math.random(dirCount), time = spinNow }
-                manipState.spin[model] = spin
-            end
-            local start = spin.index
-
-            local exposed, hiddenWall
-            local hiddenTries = 0
-            local tried = 0
-            local hiddenUntil = nil
-            for ring = 0, rings - 1 do
-                local radius = rings > 1 and first + step * ring or limit
-                if radius > 0.05 and radius < delta.Magnitude then
-                    for k = 1, dirCount do
-                        tried = tried + 1
-                        if hiddenUntil and tried > hiddenUntil then break end
-                        local i = ((start + k - 2) % dirCount) + 1
-                        local offset = dirs[i] * radius
-                        local from = origin + offset
-                        local hidden = false
-                        if hiddenTries < manipState.hiddenTries then
-                            hidden = ManipHidden(from, model)
-                        end
-                        if hidden then
-                            -- Hidden spot: the target cannot see it, so their
-                            -- aimbot cannot lock. It still has to land - a clear
-                            -- line to any body part, or cover we can shoot
-                            -- through - and sit in open air. A clear line wins
-                            -- outright; a wallbang hidden spot is only kept as a
-                            -- fallback, since the server always registers the
-                            -- former.
-                            hiddenTries = hiddenTries + 1
-                            local hitPart, hitPos, clear = ManipLands(from, model)
-                            if hitPart and ManipFree(from) then
-                                local plan = {
-                                    FinalPart = hitPart,
-                                    point = hitPos or aim,
-                                    offset = offset,
-                                    manip = true,
-                                    hidden = true,
-                                    quality = 1.45 + radius * 0.01,
-                                    label = clear
-                                        and string.format("Manip: %.1f studs hidden", radius)
-                                        or string.format("Manip: %.1f studs hidden/wall", radius),
-                                }
-                                if clear then return finish(plan) end
-                                -- Tier 2: through-cover. Auto mode tracks these
-                                -- (see ManipWallResult) so they stop being used
-                                -- if the server keeps dropping them.
-                                plan.wall = true
-                                hiddenWall = hiddenWall or plan
-                            end
-                        elseif not exposed then
-                            -- Exposed but real: keep the first (smallest) clear
-                            -- spot as the fallback, but keep looking for a
-                            -- hidden one a little further out before settling
-                            -- for it (see manipState.hiddenExtra).
-                            local hitPart, hitPos = ManipReaches(from, aim, model)
-                            if hitPart and ManipFree(from) then
-                                exposed = {
-                                    FinalPart = hitPart,
-                                    point = hitPos or aim,
-                                    offset = offset,
-                                    manip = true,
-                                    quality = 1.45 + radius * 0.01,
-                                    label = string.format("Manip: %.1f studs", radius),
-                                }
-                                hiddenUntil = tried + manipState.hiddenExtra
-                            end
-                        end
-                    end
-                    if hiddenUntil and tried >= hiddenUntil then break end
-                end
-            end
-            local plan = hiddenWall or exposed
-            if not plan then manipState.miss[model] = os.clock() end
-            return finish(plan)
-        end
-
-        -- Old helper name, kept so anything that still calls it resolves.
-        -- Published to the environment like the script's other bridges, since
-        -- its only callers are outside this file.
-        function findminoffset(target, origin)
-            local plan = ManipPlan(target, origin)
-            if plan then return plan.offset, true, plan.FinalPart end
-            return nil, false, nil
-        end
-        do
-            local env = (type(getgenv) == "function" and getgenv()) or _G
-            env.findminoffset = findminoffset
-        end
-    --#endregion
-
-
 
     --#region targetting
 
@@ -2337,7 +2088,7 @@ do -- combat
                 for i = si + 1, #shadows do shadows[i].Visible = false end
             end
 
-            local _fovconnection = RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(render))
+            local _fovconnection = NHGuard.conn(RunService.Heartbeat, LPH_NO_VIRTUALIZE(render))
         end
 
         function GetTarget()
@@ -2387,9 +2138,9 @@ do -- combat
             local function report(label)
                 if plr then ShotScanResults[plr] = {label = label, time = os.clock()} end
             end
-            local function plan(part, point, quality, label, offset)
+            local function plan(part, point, quality, label, shotOrigin)
                 report(label)
-                return {FinalPart = part, point = point, offset = offset or Vector3.zero, quality = quality}
+                return {FinalPart = part, point = point, quality = quality, origin = shotOrigin}
             end
 
             -- 1. Direct line to the head (or whatever the caller asked for).
@@ -2410,8 +2161,8 @@ do -- combat
             considerWall(target, target.Position, direct)
 
             -- Smart UG fallback: an angled line whose only obstruction is
-            -- terrain (the bullet skims under the map surface). Clear lines,
-            -- hitscan and measured wallpen plans always win - this is only
+            -- terrain (the bullet skims under the map surface). Clear lines
+            -- and measured wallpen plans always win - this is only
             -- spent when nothing better exists. The shallowest line wins,
             -- because a flatter angle is what lets the bullet travel under the
             -- ground instead of driving straight down into it.
@@ -2444,7 +2195,7 @@ do -- combat
             -- Smart UG only needs the rest of the rig when the head line already
             -- skims terrain: a lower part gives a shallower under-map angle, and
             -- a wall (not terrain) blocking the head is never bypassed this way.
-            local scanBody = HitScanEnabled or HitboxExpander.Enabled or WallPen.Enabled
+            local scanBody = HitboxExpander.Enabled or WallPen.Enabled
                 or (WallPen.TerrainPass and direct.state == "terrain")
             if scanBody then
                 for _, name in ipairs(RIG_PART_NAMES) do
@@ -2454,31 +2205,15 @@ do -- combat
                     end
                 end
             end
-            -- With hitscan off, wallpen still needs one ray per body part, so the
-            -- ray budget never drops below the number of parts being examined.
-            local count = HitScanEnabled
-                and math.clamp(math.floor(HitScanCount), 1, 200)
-                or (scanBody and math.max(#parts, 1) or 1)
-            local golden = math.pi * (3 - math.sqrt(5))
-            local expand = HitboxExpander.Enabled and math.max(HitboxExpander.Size, 0) or 0
+            -- Wallpen still needs one ray per body part, so the ray budget
+            -- never drops below the number of parts being examined.
+            local count = scanBody and math.max(#parts, 1) or 1
             for i = 1, count do
                 local part = parts[((i - 1) % #parts) + 1]
                 local point = part.Position
-                if i > #parts then
-                    -- Extra hitscan samples: surface points (with the expander
-                    -- radius applied when it is on).
-                    local y = 1 - 2 * ((i - 0.5) / math.max(count, 1))
-                    local radial = math.sqrt(math.max(0, 1 - y * y))
-                    local angle = i * golden
-                    local unit = Vector3.new(math.cos(angle) * radial, y, math.sin(angle) * radial)
-                    local half = part.Size * 0.42 + Vector3.new(expand, expand, expand)
-                    point = part.CFrame:PointToWorldSpace(
-                        Vector3.new(unit.X * half.X, unit.Y * half.Y, unit.Z * half.Z))
-                end
                 local trace = WallPen.Probe(part, origin, point, model)
                 if trace.state == "clear" then
-                    return plan(trace.reached or part, point, 1,
-                        HitScanEnabled and "Hitscan: clear" or "Body: clear")
+                    return plan(trace.reached or part, point, 1, "Body: clear")
                 elseif trace.state == "blocked" then
                     considerWall(part, point, trace)
                 elseif trace.state == "terrain" then
@@ -2486,19 +2221,26 @@ do -- combat
                 end
             end
 
-            -- 3.5 Origin manipulation: the smallest shift that lands a shot,
-            --     preferring spots the target cannot see. Runs before wallpen,
-            --     because a clear line from a validated origin beats a claimed
-            --     through-wall shot from where we stand.
-            if Manip.Enabled then
-                local manipPlan = ManipPlan(target, origin)
-                if manipPlan then
-                    report(manipPlan.label)
-                    return manipPlan
+            -- 4. Origin manip, before wallpen: in "Manip first" order it always
+            --    runs; in "Auto" it runs when the first thing the head line
+            --    hits is only a few studs away, so the origin is sitting in or
+            --    against the cover (tree foliage, a tight corner). A wallpen
+            --    reading from there says "thin and penetrable", but the shot
+            --    spawns inside the cover and dies in it. Cover further out is a
+            --    real wall and still goes to wallpen.
+            local manipInCover = BlockedOrder == "Auto (manip in cover)"
+                and direct.state == "blocked" and direct.entry
+                and (direct.entry - origin).Magnitude <= MANIP_CLOSE_COVER
+            if Manip.Enabled
+                and (BlockedOrder == "Manip first" or manipInCover) then
+                local offset, hitPart = Manip.FindOffset(target, origin, true)
+                if offset and hitPart then
+                    return plan(hitPart, hitPart.Position, 1.9,
+                        "Manip: origin shift", origin + offset)
                 end
             end
 
-            -- 4. Wallpen: only when the measured cover fits the whole budget
+            -- 5. Wallpen: only when the measured cover fits the whole budget
             --    (thickness and layers), on the thinnest point we found.
             if WallPen.Enabled and bestWall then
                 -- Refine around the cheapest blocked part: cover is rarely a
@@ -2516,8 +2258,7 @@ do -- combat
                         local point = part.CFrame:PointToWorldSpace(offset)
                         local trace = WallPen.Probe(part, origin, point, model)
                         if trace.state == "clear" then
-                            return plan(trace.reached or part, point, 1,
-                                HitScanEnabled and "Hitscan: clear" or "Body: clear")
+                            return plan(trace.reached or part, point, 1, "Body: clear")
                         elseif trace.state == "blocked" then
                             considerWall(part, point, trace)
                         end
@@ -2538,10 +2279,23 @@ do -- combat
 
             -- Smart UG / terrain wallbang: no clear line and no measurable
             -- wallpen was better, so spend the shot on the angled under-map
-            -- line - the bullet skims the terrain and still registers.
-            if bestTerrain then
+            -- line - the bullet skims the terrain and still registers. It is
+            -- part of the wallbang path, so it follows the same switch.
+            if WallPen.Enabled and bestTerrain then
                 return plan(bestTerrain.part, bestTerrain.point, 1.8,
                     "Smart UG: under map")
+            end
+
+            -- 6. Origin manip, last resort: reached only when nothing above
+            --    produced a shot (wallpen too thick, terrain the only line, or
+            --    wallpen off). The plan carries the nudged origin and the
+            --    callers fire from it.
+            if Manip.Enabled then
+                local offset, hitPart = Manip.FindOffset(target, origin, true)
+                if offset and hitPart then
+                    return plan(hitPart, hitPart.Position, 2, "Manip: origin shift",
+                        origin + offset)
+                end
             end
 
             report(direct.state == "blocked" and "Blocked" or "No hit")
@@ -2585,7 +2339,7 @@ do -- combat
                 or LocalHead.CFrame.LookVector
 
             -- Cheap pass, zero rays: only team/alive/range/alignment. The old
-            -- version ran the full shot evaluation (hitscan + wallpen traces)
+            -- version ran the full shot evaluation (wallpen traces)
             -- on every player in the server, every frame, which is where the
             -- frame time went. Only the best few candidates get evaluated now.
             local candidates = {}
@@ -2658,7 +2412,7 @@ do -- combat
             restorefunction(castRay)
         end 
 
-        local old; old = hookfunction(castRay, function(p30, p31, p32, ...)
+        local old; old = NHGuard.hook(castRay, function(p30, p31, p32, ...)
             local character = LocalPlayer.Character
             local head = character and character:FindFirstChild("Head")
             local realOrigin = head and AARealPartPosition(head)
@@ -2693,126 +2447,30 @@ do -- combat
     
 
     --#region ragebot
-        --Remotes.ShootEvent
+        -- Fires the gun remote without letting one bad shot take the combat
+        -- loop down. The game rebuilds GunRemotes between rounds, which leaves
+        -- the cached RemoteEvent destroyed; calling FireServer on it - or
+        -- sending a shot whose part was destroyed mid-tick - throws
+        -- "Unable to cast value to Object". Re-resolve the remote, then fire
+        -- under pcall so a failure is reported once instead of every frame.
+        local LastFireError = 0
+        local function FireShootEvent(...)
+            local shootEvent = Remotes.ShootEvent
+            if not shootEvent or not shootEvent.Parent then
+                local folder = ReplicatedStorage:FindFirstChild("GunRemotes")
+                shootEvent = folder and folder:FindFirstChild("ShootEvent")
+                Remotes.ShootEvent = shootEvent
+            end
+            if not shootEvent then return end
+            local ok, err = pcall(shootEvent.FireServer, shootEvent, ...)
+            if not ok and os.clock() - LastFireError > 2 then
+                LastFireError = os.clock()
+                warn("[negrohax] shot failed: " .. tostring(err))
+            end
+        end
 
         if isfunctionhooked(getrawmetatable(game).__namecall) then
             restorefunction(getrawmetatable(game).__namecall)
-        end
-
-        -- Origin manip, the half that actually registers. The server validates
-        -- every shot from the pose it holds for us, so rewriting v[1] alone is
-        -- dropped (that was the whole reason the old build moved the server
-        -- pose). This shifts ONLY the server-held pose by the manip offset -
-        -- never more than the manip distance, in any direction - waits one
-        -- network window so the server has it, fires from there, then puts the
-        -- pose straight back as soon as the shot is on the wire. The client body
-        -- and camera never move, and it is never a teleport to the target.
-        local manipBusy = false
-        local function FireManipShot(Target, baseHead, plan, count)
-            -- Returns true only when this call took ownership and will try to
-            -- fire. The ragebot uses that so a manip already in flight does not
-            -- burn a round / a fire-rate slot without a shot behind it.
-            if manipBusy then return false end
-            local env = (type(getgenv) == "function" and getgenv()) or _G
-            if type(env.AdvancedAASetOverride) ~= "function" then return false end
-            local character = LocalPlayer.Character
-            local root = character and character:FindFirstChild("HumanoidRootPart")
-            local head = character and character:FindFirstChild("Head")
-            local model = Target and Target:FindFirstAncestorOfClass("Model")
-            if not (root and head and Target and Target.Parent and model) then return false end
-
-            -- The pose the server will hold once the override lands: the head
-            -- goes to baseHead + offset (the offset is never added twice - that
-            -- double shift is what the server dropped as invalid). Check NOW,
-            -- synchronously, that a shot actually exists from that exact spot:
-            -- if it does not there is nothing to wait for, so do not take
-            -- ownership and let the caller keep its round / fire-rate slot.
-            -- EvaluateShot only reads the origin vector, and the override puts
-            -- the head on `spot` to the stud, so this is the same answer the
-            -- task would get after the pose has moved.
-            local spot = baseHead + plan.offset
-            local aimPart = model:FindFirstChild("Head") or Target
-            local savedManip = Manip.Enabled
-            Manip.Enabled = false
-            local okPlan, shotPlan = pcall(EvaluateShot, aimPart, spot)
-            Manip.Enabled = savedManip
-            if not okPlan or not shotPlan then
-                -- The cached spot no longer produces a shot (the target moved,
-                -- the cover changed): drop it so the next search re-rolls.
-                manipState.cache[model] = nil
-                manipState.miss[model] = nil
-                manipState.spin[model] = nil
-                return false
-            end
-
-            manipBusy = true
-            task.spawn(function()
-                -- Head onto `spot`, root under it, facing the target (same shape
-                -- as the old resolver's spot).
-                local realRoot = AARealPartPosition(root)
-                local realHead = AARealPartPosition(head)
-                local rootPos = spot - (realHead - realRoot)
-                local look = Vector3.new(Target.Position.X, rootPos.Y, Target.Position.Z)
-                local cf = (look - rootPos).Magnitude > 0.1
-                    and CFrame.lookAt(rootPos, look) or CFrame.new(rootPos)
-
-                pcall(env.AdvancedAASetOverride, cf)
-                local ok, err = pcall(function()
-                    -- Let the shifted pose reach the server first, or the shot
-                    -- is still validated against the old pose. That mismatch
-                    -- was the single biggest source of invalids, so wait for
-                    -- the server to actually hold the pose instead of a fixed
-                    -- slice of time.
-                    local window = math.max(AASyncWindow(), 0.05)
-                    local deadline = os.clock() + window + 0.2
-                    task.wait(window)
-                    while os.clock() < deadline and AAShotState() == "transition" do
-                        task.wait()
-                    end
-                    if not Target.Parent or not head.Parent then return end
-                    -- Fire from the EXACT shifted head. The pre-check already
-                    -- proved a shot exists there and the override puts the head
-                    -- on `spot`, so the origin is `spot` - no second offset.
-                    local origin = spot
-                    local shots = {}
-                    for i = 1, math.max(1, count or 1) do
-                        shots[i] = { origin, shotPlan.point, shotPlan.FinalPart }
-                    end
-                    MarkShots(shots)
-                    Remotes.ShootEvent:FireServer(shots)
-                    -- Auto tier 2: a through-cover manip only stays enabled while
-                    -- it lands. Watch this target's health and feed the result
-                    -- back (see ManipWallResult), so a gun that drops wallbangs
-                    -- falls back to clear-line spots on its own. A miss while the
-                    -- target was clearly moving is not a wallbang rejection, so
-                    -- it is ignored instead of counting against tier 2.
-                    if plan.wall then
-                        local humanoid = model:FindFirstChildOfClass("Humanoid")
-                        if humanoid then
-                            local before = humanoid.Health
-                            local posBefore = model:GetPivot().Position
-                            task.delay(0.35, function()
-                                if humanoid.Parent then
-                                    if humanoid.Health < before then
-                                        ManipWallResult(true)
-                                    elseif (model:GetPivot().Position - posBefore).Magnitude <= 3 then
-                                        ManipWallResult(false)
-                                    end
-                                end
-                            end)
-                        end
-                    end
-                    -- Restore as soon as the shot is on the wire: it was sent
-                    -- before the pose snaps back, so the server validates it
-                    -- against the shifted pose. Only a single frame of hold, to
-                    -- keep the visible teleport as short as it can be.
-                    task.wait()
-                end)
-                pcall(env.AdvancedAASetOverride, nil)
-                if not ok then warn("manip shot:", err) end
-                manipBusy = false
-            end)
-            return true
         end
 
         -- Fires a silent-aim shot once the server pose has settled (transition
@@ -2834,15 +2492,10 @@ do -- combat
                         local origin = (state == "server") and AAServerPartPosition(head)
                             or AARealPartPosition(head)
                         local plan = EvaluateShot(Target, origin)
-                        if plan and plan.manip then
-                            FireManipShot(Target, origin, plan, #Args[1])
-                            return
-                        end
                         if plan then
-                            origin += plan.offset
                             for _, v in Args[1] do
                                 if type(v) == "table" then
-                                    v[1] = origin
+                                    v[1] = plan.origin or origin
                                     v[2] = plan.point
                                     v[3] = plan.FinalPart
                                 end
@@ -2858,7 +2511,7 @@ do -- combat
                                 AAPeek(AASyncWindow() + 0.1)
                             end
                             MarkShots(Args[1])
-                            Remotes.ShootEvent:FireServer(table.unpack(Args))
+                            FireShootEvent(table.unpack(Args))
                             if state == "server" then
                                 local hitModel = plan.FinalPart:FindFirstAncestorOfClass("Model")
                                 FailsafeWatch(hitModel and Players:GetPlayerFromCharacter(hitModel))
@@ -2887,11 +2540,15 @@ do -- combat
             end)
         end
 
-        local mtHook; mtHook = hookfunction(getrawmetatable(game).__namecall, function(self, ...)
+        local mtHook; mtHook = NHGuard.hook(getrawmetatable(game).__namecall, function(self, ...)
             local namecallmethod = getnamecallmethod()
 
             if not checkcaller() and SilentAimEnabled and SilentAimTarget and not RagebotTarget and rawequal(self, Remotes.ShootEvent) and namecallmethod == "FireServer" then
                 local Args = {...}
+                -- The shifted origin when this shot came from origin manip, else
+                -- nil. Read by the tracer below so it starts where the bullet
+                -- really does instead of at the muzzle.
+                local manipOrigin
                 local Target = GetTarget()
                 local LocalCharacter = LocalPlayer.Character
                 SilentAimTarget = nil
@@ -2937,22 +2594,15 @@ do -- combat
                             return nil
                         end
 
-                        if plan and plan.manip then
-                            -- Origin manip plan: the server validates the shot
-                            -- from the pose it holds, so move ONLY the server
-                            -- pose by the offset and fire from there.
-                            FireManipShot(Target, origin, plan, #Args[1])
-                            setnamecallmethod(namecallmethod)
-                            return nil
-                        end
-
                         if plan then
-                            origin += plan.offset
                             for _, v in Args[1] do
-                                v[1] = origin
+                                v[1] = plan.origin or origin
                                 v[2] = plan.point
                                 v[3] = plan.FinalPart
                             end
+                            -- Manip plan: remember the shifted origin so the
+                            -- tracer below starts there instead of the muzzle.
+                            manipOrigin = plan.origin
                             if state == "server" then
                                 -- Orbiting pose: with smooth shots on this
                                 -- is a no-op (the orbit keeps running); with
@@ -2971,7 +2621,7 @@ do -- combat
                             -- either wrong (real pose -> invalid) or blocked
                             -- (server pose -> dropped shot), so the shot is
                             -- held instead of firing another invalid. The
-                            -- peek / peek resolver makes the target hittable.
+                            -- peek makes the target hittable.
                             setnamecallmethod(namecallmethod)
                             return nil
                         end
@@ -2989,7 +2639,9 @@ do -- combat
                             break
                         end
                     end
-                    ViewModelShot(point, origin)
+                    -- manipOrigin is set above when the shot came from origin
+                    -- manip; nil for a plain shot.
+                    ViewModelShot(point, origin, manipOrigin)
                 end
 
                 setnamecallmethod(namecallmethod)
@@ -3008,6 +2660,8 @@ do -- combat
                             break
                         end
                     end
+                    -- A game-originated shot, so it is never a manip plan: the
+                    -- tracer starts at the muzzle as usual.
                     ViewModelShot(point, origin)
                 end
             end
@@ -3018,9 +2672,10 @@ do -- combat
         end)
 
         task.spawn(function()
+            local gen = NHGuard.gen
             local LastShot = 0
 
-            while true do
+            while NHGuard.alive(gen) do
                 task.wait()
 
                 if not RageBotEnabled then
@@ -3104,34 +2759,34 @@ do -- combat
                 local targetModel = FinalPart and FinalPart:FindFirstAncestorOfClass("Model")
                 local targetPlayer = targetModel and Players:GetPlayerFromCharacter(targetModel)
                 if not targetPlayer or not CombatPriority(targetPlayer) then continue end
-                if t.manip then
-                    -- Origin manip plan: move only the server pose by the
-                    -- offset and fire from there (see FireManipShot). Only
-                    -- spend the round / fire-rate slot when it actually
-                    -- launched - a manip already in flight returns false.
-                    if FireManipShot(FinalPart, origin, t, Gun:GetAttribute("ProjectileCount") or 1) then
-                        LastShot = os.clock()
-                        Gun:SetAttribute("Local_CurrentAmmo", Ammo - 1)
-                    end
-                    continue
-                end
-                origin = origin + t.offset
                 local Shots = {}
 
                 for i = 1, Gun:GetAttribute("ProjectileCount") or 1 do
-                    Shots[i] = { origin, t.point, FinalPart }
+                    Shots[i] = { t.origin or origin, t.point, FinalPart }
                 end
 
                 LastShot = os.clock()
 
-                Remotes.ShootEvent:FireServer(Shots)
+                -- Validate before firing: a plan whose part was destroyed
+                -- between the trace and the shot (target despawned mid-tick)
+                -- or a non-Vector3 point is what turned into the
+                -- "Unable to cast value to Object" error out of FireServer.
+                if typeof(t.point) == "Vector3" and typeof(FinalPart) == "Instance"
+                    and FinalPart.Parent then
+                    -- Mark the shot so the hit-sound / hitmarker hook on the
+                    -- victim's HealthChanged can see it. FireShootEvent calls
+                    -- the remote with pcall(remote.FireServer, ...), which
+                    -- bypasses the __namecall hook that marks ordinary shots,
+                    -- so the ragebot's own shots have to be marked here.
+                    MarkShots(Shots)
+                    FireShootEvent(Shots)
+                end
                 if state == "server" then FailsafeWatch(targetPlayer) end
                 Gun:SetAttribute("Local_CurrentAmmo", Ammo - 1)
             end
         end)
 
     --#endregion
-
 
 
     --#region gun mods
@@ -3142,7 +2797,7 @@ do -- combat
             restorefunction(shoot)
         end 
 
-        local oldShoot; oldShoot = hookfunction(shoot, function(...) 
+        local oldShoot; oldShoot = NHGuard.hook(shoot, function(...) 
             -- The upvalue walk is not free and the gun config table never
             -- moves, so it is only read while one of the mods is actually on.
             if not (ForceFullAuto or RapidFireEnabled or NoSpread) then
@@ -3182,7 +2837,7 @@ do -- combat
         -- debug.traceback() is one of the most expensive calls available and
         -- the old version ran it on EVERY task.wait() in the whole game, even
         -- with instant reload off. It is only needed while the mod is on.
-        local oldWait; oldWait = hookfunction(task.wait, function(time, ...)
+        local oldWait; oldWait = NHGuard.hook(task.wait, function(time, ...)
             if InstantReload and type(time) == "number" and time > 0 then
                 local ok, tb = pcall(debug.traceback)
                 if ok and type(tb) == "string" and tb:find("reload", 1, true) then
@@ -3214,8 +2869,9 @@ do -- combat
         -- equipped, and it needs at least two guns in the rig, so keys, melee
         -- and the taser stay where they are.
         task.spawn(function()
+            local gen = NHGuard.gen
             local lastSwitch = 0
-            while true do
+            while NHGuard.alive(gen) do
                 task.wait(0.05)
                 if not AutoWeaponSwitch then continue end
                 local now = os.clock()
@@ -3255,6 +2911,8 @@ do -- combat
                 end
             end
         end)
+
+    print("[negrohax] gun mods ready")
 
     --#endregion
 
@@ -3413,52 +3071,6 @@ do -- combat
             end 
         })
         
-        -- Origin manip: fires from the smallest offset around your own head that
-        -- can land on the target, preferring spots the target cannot see so
-        -- their aimbot cannot lock on. Only the server-held pose moves -
-        -- invisibly, by at most the manip distance, in any direction - and it is
-        -- put straight back; your client body, camera and physics never move.
-        Sections.aimbot:Toggle({
-            Name = 'origin manip';
-            Flag = 'manip';
-            Default = false;
-            Callback = function(v)
-                Manip.Enabled = v;
-            end
-        })
-
-        Sections.aimbot:Slider({
-            Name = 'manip dist (studs)';
-            Flag = 'manipdist';
-            Min = 0;
-            Max = 20;
-            Default = 20;
-            Decimals = 0.5;
-            Callback = function(v)
-                Manip.Max = v;
-            end
-        })
-
-        Sections.aimbot:Slider({
-            Name = 'manip scan count';
-            Flag = 'manipscancount';
-            Min = 4;
-            Max = 48;
-            Default = 12;
-            Decimals = 1;
-            Callback = function(v)
-                Manip.Scan = math.floor(v);
-            end
-        })
-        Sections.aimbot:Toggle({
-            Name = "hitscan"; Flag = "fibonaccihitscan"; Default = false;
-            Callback = function(v) HitScanEnabled = v end;
-        })
-        Sections.aimbot:Slider({
-            Name = "hitscan samples"; Flag = "hitscansamples";
-            Min = 1; Max = 200; Default = 32; Decimals = 1;
-            Callback = function(v) HitScanCount = v end;
-        })
         -- How many of the best candidates the aim actually evaluates per shot.
         -- Lower = fewer raycasts = more fps; every candidate above this is only
         -- sorted by team/alignment/distance, so the chosen target rarely changes.
@@ -3467,9 +3079,38 @@ do -- combat
             Min = 1; Max = 25; Default = 8; Decimals = 1;
             Callback = function(v) MaxAimCandidates = v end;
         })
+        -- Blocked shots: wallbang and origin manip are two answers to the same
+        -- question ("the target is covered - how do I still land the shot?"),
+        -- so they share one switch. Wallbang fires through cover the server
+        -- will let a bullet pass; manip instead nudges the shot origin until
+        -- the line is genuinely clear and fires from there. The dropdown picks
+        -- which is tried first, and whether either is used at all.
         Sections.aimbot:Toggle({
-            Name = "wallpen"; Flag = "wallpen"; Default = false;
-            Callback = function(v) WallPen.Enabled = v end;
+            Name = "blocked shots (wallbang + manip)"; Flag = "wallpen";
+            Default = true;
+            Callback = function(v)
+                BlockedEnabled = v;
+                ApplyBlockedMode();
+            end;
+        })
+        Sections.aimbot:Dropdown({
+            Name = "blocked shot order"; Flag = "blockedorder";
+            Items = BLOCKED_ORDER_ITEMS;
+            Default = "Auto (manip in cover)";
+            Callback = function(v)
+                BlockedOrder = v;
+                ApplyBlockedMode();
+            end;
+        })
+        -- How far the shot origin may be nudged (studs). The search itself is
+        -- fixed: a Fibonacci sphere of 20 samples, shortest working nudge wins.
+        Sections.aimbot:Slider({
+            Name = "manip dist (studs)"; Flag = "manipdist";
+            Min = 0; Max = 50; Default = 10; Decimals = 1;
+            Callback = function(v)
+                Manip.Dist = v;
+                table.clear(Manip.Cache);
+            end;
         })
         -- Vehicle wallbang: cars stop counting as cover, so the aim can shoot
         -- straight through them at whoever is behind or inside. Works with
@@ -3498,7 +3139,7 @@ do -- combat
         -- Smart UG / terrain wallbang: this game's bullets skim UNDER the map
         -- surface on angled lines, so terrain is not real cover. With this on,
         -- the aim will spend a shot on an angled under-map line when no clear
-        -- line, hitscan or measurable wallpen plan exists. Steep (near
+        -- line or measurable wallpen plan exists. Steep (near
         -- vertical) terrain lines stay blocked, and the failsafe backoff still
         -- quiets repeated terrain attempts.
         Sections.aimbot:Toggle({
@@ -3601,8 +3242,8 @@ do -- combat
                 whitelistDrop:Refresh(PlayerNameList())
                 blacklistDrop:Refresh(PlayerNameList())
             end
-            Players.PlayerAdded:Connect(RefreshPlayerLists)
-            Players.PlayerRemoving:Connect(function()
+            NHGuard.conn(Players.PlayerAdded, RefreshPlayerLists)
+            NHGuard.conn(Players.PlayerRemoving, function()
                 task.defer(RefreshPlayerLists)
             end)
         end
@@ -3688,7 +3329,7 @@ do -- combat
         line.Transparency = SnapLine.Transparency
         line.Color = SnapLine.Color
 
-        RunService.RenderStepped:Connect(function()
+        NHGuard.conn(RunService.RenderStepped, function()
             if not SnapLine.Enabled then
                 if line.Visible then line.Visible = false end
                 return
@@ -3825,7 +3466,7 @@ do -- combat
             end
         end
 
-        RunService.RenderStepped:Connect(function(dt)
+        NHGuard.conn(RunService.RenderStepped, function(dt)
             if not Tracker.Enabled then
                 hideAll()
                 return
@@ -4604,19 +4245,19 @@ if LocalPlayer.Character then
     task.spawn(GhostSetupCharacter, LocalPlayer.Character)
 end
 
-LocalPlayer.CharacterAdded:Connect(function(character)
+NHGuard.conn(LocalPlayer.CharacterAdded, function(character)
     task.spawn(GhostSetupCharacter, character)
 end)
 
 -- Position recording
-RunService.Heartbeat:Connect(function()
+NHGuard.conn(RunService.Heartbeat, function()
     if not GhostEnabled then return end
 
     GhostRecordPosition()
 end)
 
 -- Ghost animation
-RunService.RenderStepped:Connect(function(delta)
+NHGuard.conn(RunService.RenderStepped, function(delta)
     if not GhostEnabled or not Ghost or not GhostCharacter then
         return
     end
@@ -4956,7 +4597,7 @@ ListPadding.PaddingLeft = UDim.new(0, 6)
 ListPadding.PaddingRight = UDim.new(0, 6)
 ListPadding.Parent = ResolverList
 
-ListLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+NHGuard.conn(ListLayout:GetPropertyChangedSignal("AbsoluteContentSize"), function()
     ResolverList.CanvasSize = UDim2.new(
         0, 0, 0, ListLayout.AbsoluteContentSize.Y + 12
     )
@@ -4971,7 +4612,7 @@ local DragStart
 local StartPosition
 local DragInput
 
-ResolverHeader.InputBegan:Connect(function(input)
+NHGuard.conn(ResolverHeader.InputBegan, function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1
         or input.UserInputType == Enum.UserInputType.Touch then
 
@@ -4979,7 +4620,7 @@ ResolverHeader.InputBegan:Connect(function(input)
         DragStart = input.Position
         StartPosition = ResolverPanel.Position
 
-        input.Changed:Connect(function()
+        NHGuard.conn(input.Changed, function()
             if input.UserInputState == Enum.UserInputState.End then
                 Dragging = false
             end
@@ -4987,7 +4628,7 @@ ResolverHeader.InputBegan:Connect(function(input)
     end
 end)
 
-ResolverHeader.InputChanged:Connect(function(input)
+NHGuard.conn(ResolverHeader.InputChanged, function(input)
     if input.UserInputType == Enum.UserInputType.MouseMovement
         or input.UserInputType == Enum.UserInputType.Touch then
 
@@ -4995,7 +4636,7 @@ ResolverHeader.InputChanged:Connect(function(input)
     end
 end)
 
-UserInputService.InputChanged:Connect(function(input)
+NHGuard.conn(UserInputService.InputChanged, function(input)
     if Dragging and input == DragInput then
         local delta = input.Position - DragStart
 
@@ -5040,8 +4681,8 @@ for _, player in ipairs(Players:GetPlayers()) do
     ResolverSetupPlayer(player)
 end
 
-Players.PlayerAdded:Connect(ResolverSetupPlayer)
-Players.PlayerRemoving:Connect(ResolverRemovePlayer)
+NHGuard.conn(Players.PlayerAdded, ResolverSetupPlayer)
+NHGuard.conn(Players.PlayerRemoving, ResolverRemovePlayer)
 
 -- ==========================================
 -- MOVEMENT ANALYSIS
@@ -5226,7 +4867,7 @@ end
 
 local ResolverAccumulator = 0
 
-RunService.Heartbeat:Connect(function(delta)
+NHGuard.conn(RunService.Heartbeat, function(delta)
     if not ResolverEnabled then return end
 
     ResolverAccumulator += delta
@@ -5337,7 +4978,7 @@ end -- movement resolver
 
     --#region calm luh logic brader
 
-        RunService.RenderStepped:Connect(function()
+        NHGuard.conn(RunService.RenderStepped, function()
             if FullbrightEnabled then
                 -- Guarded: writing the same value every frame still fires
                 -- property-changed signals all over the lighting system.
@@ -5378,7 +5019,7 @@ end -- movement resolver
                 end
             end
         end)
-        Camera:GetPropertyChangedSignal("FieldOfView"):Connect(function() 
+        NHGuard.conn(Camera:GetPropertyChangedSignal("FieldOfView"), function() 
             if FovChanger and Camera.FieldOfView ~= Fov then 
                 Camera.FieldOfView = Fov
             end
@@ -5560,13 +5201,13 @@ end
 local function ToolChamsBind(tool)
     ToolChamsDisconnect(ToolChamsToolConns)
 
-    table.insert(ToolChamsToolConns, tool.DescendantAdded:Connect(function(object)
+    table.insert(ToolChamsToolConns, NHGuard.conn(tool.DescendantAdded, function(object)
         if ToolChams.Enabled then
             ToolChamsTrack(object)
         end
     end))
 
-    table.insert(ToolChamsToolConns, tool.DescendantRemoving:Connect(function(object)
+    table.insert(ToolChamsToolConns, NHGuard.conn(tool.DescendantRemoving, function(object)
         ToolChamsTracked[object] = nil
         ToolChamsOriginals[object] = nil
     end))
@@ -5617,13 +5258,13 @@ local function ToolChamsWatch(character)
     ToolChamsDisconnect(ToolChamsCharacterConns)
     ToolChamsRestore()
 
-    table.insert(ToolChamsCharacterConns, character.ChildAdded:Connect(function(child)
+    table.insert(ToolChamsCharacterConns, NHGuard.conn(character.ChildAdded, function(child)
         if child:IsA("Tool") then
             task.defer(ApplyToolChams)
         end
     end))
 
-    table.insert(ToolChamsCharacterConns, character.ChildRemoved:Connect(function(child)
+    table.insert(ToolChamsCharacterConns, NHGuard.conn(character.ChildRemoved, function(child)
         if child == ToolChamsTool or child:IsA("Tool") then
             task.defer(ApplyToolChams)
         end
@@ -5632,12 +5273,12 @@ local function ToolChamsWatch(character)
     task.defer(ApplyToolChams)
 end
 
-LocalPlayer.CharacterAdded:Connect(ToolChamsWatch)
+NHGuard.conn(LocalPlayer.CharacterAdded, ToolChamsWatch)
 if LocalPlayer.Character then
     ToolChamsWatch(LocalPlayer.Character)
 end
 
-RunService.RenderStepped:Connect(function(dt)
+NHGuard.conn(RunService.RenderStepped, function(dt)
     if ToolChams.Rainbow and ToolChams.Enabled then
         local hue, saturation, brightness = ToolChams.Color:ToHSV()
         ToolChams.Color = Color3.fromHSV((hue + dt * ToolChams.RainbowSpeed) % 1, saturation, brightness)
@@ -5818,7 +5459,7 @@ end
 local function SetupChamsPlayer(player)
     if player == ChamsLocalPlayer then return end
 
-    player.CharacterAdded:Connect(function()
+    NHGuard.conn(player.CharacterAdded, function()
         task.wait(0.5)
 
         if ChamsEnabled then
@@ -5852,10 +5493,10 @@ for _, player in ipairs(ChamsPlayers:GetPlayers()) do
 end
 
 -- New players
-ChamsPlayers.PlayerAdded:Connect(SetupChamsPlayer)
+NHGuard.conn(ChamsPlayers.PlayerAdded, SetupChamsPlayer)
 
 -- Leaving players
-ChamsPlayers.PlayerRemoving:Connect(function(player)
+NHGuard.conn(ChamsPlayers.PlayerRemoving, function(player)
     if ChamsHighlights[player] then
         ChamsHighlights[player]:Destroy()
         ChamsHighlights[player] = nil
@@ -5864,7 +5505,8 @@ end)
 
 -- Reconcile highlights when teams or the shared policy change.
 task.spawn(function()
-    while task.wait(0.5) do
+    local gen = NHGuard.gen
+    while NHGuard.alive(gen) and task.wait(0.5) do
         if ChamsEnabled then
             for _, plr in ipairs(ChamsPlayers:GetPlayers()) do
                 if plr ~= ChamsLocalPlayer then
@@ -6030,7 +5672,7 @@ Sections.visuals:Slider({
                 local TimeChangerEnabled = false
                 local TimeChangerValue = 12
 
-                RunService.RenderStepped:Connect(function()
+                NHGuard.conn(RunService.RenderStepped, function()
                     if not TimeChangerEnabled then return end
                     if Lighting.ClockTime ~= TimeChangerValue then
                         Lighting.ClockTime = TimeChangerValue
@@ -6207,7 +5849,7 @@ Sections.visuals:Slider({
                 end
             end
 
-            RunService.RenderStepped:Connect(function(dt)
+            NHGuard.conn(RunService.RenderStepped, function(dt)
                 if not PlayerAura.Enabled then
                     if auraModel then teardown() end
                     return
@@ -6367,7 +6009,7 @@ Sections.visuals:Slider({
                 end
             end
 
-            RunService.RenderStepped:Connect(function()
+            NHGuard.conn(RunService.RenderStepped, function()
                 if not SelfChams.Enabled then
                     if highlight or light then teardown() end
                     return
@@ -6386,7 +6028,7 @@ Sections.visuals:Slider({
                 apply()
             end)
 
-            LocalPlayer.CharacterAdded:Connect(function()
+            NHGuard.conn(LocalPlayer.CharacterAdded, function()
                 if SelfChams.Enabled then task.defer(build) end
             end)
 
@@ -6570,7 +6212,7 @@ local _NoclipEnabled = true
 local InfiniteJumpEnabled = false
 
 local _InfiniteJumpConnection =
-    UserInputService.JumpRequest:Connect(function()
+    NHGuard.conn(UserInputService.JumpRequest, function()
 
         if not InfiniteJumpEnabled then
             return
@@ -6679,7 +6321,7 @@ local _InfiniteJumpConnection =
                 task.delay(1, function()
                     if DoorRemoval.Enabled then SweepDoors() end
                 end)
-                DoorRemoval.Connection = workspace.DescendantAdded:Connect(function(object)
+                DoorRemoval.Connection = NHGuard.conn(workspace.DescendantAdded, function(object)
                     if DoorRemoval.Enabled and object:IsA("BasePart") then
                         task.defer(function()
                             if DoorRemoval.Enabled then StripDoor(object) end
@@ -6757,7 +6399,7 @@ local _InfiniteJumpConnection =
         -- A slow catch-all sweep: the flags only change when a player toggles their
         -- own script, so there is no reason to touch every part every frame.
         local sweepClock = 0
-        RunService.Heartbeat:Connect(function(dt)
+        NHGuard.conn(RunService.Heartbeat, function(dt)
             if not RestoreHitboxes.Enabled then return end
             sweepClock += dt
             if sweepClock < 0.5 then return end
@@ -6864,7 +6506,7 @@ local function StartInvalTimer()
 
     Fill.Size = UDim2.new(0, 0, 1, 0)
 
-    Connection = RunService.RenderStepped:Connect(function()
+    Connection = NHGuard.conn(RunService.RenderStepped, function()
         local Elapsed = os.clock() - StartTime
         local Progress = math.clamp(Elapsed / DURATION, 0, 1)
 
@@ -6906,7 +6548,7 @@ StartInvalTimer()
 local function ConnectTool(tool)
     if not tool:IsA("Tool") then return end
 
-    tool.Equipped:Connect(function()
+    NHGuard.conn(tool.Equipped, function()
         if _G.StartInvalTimer then
             _G.StartInvalTimer()
         end
@@ -6921,7 +6563,7 @@ local function MonitorCharacter(character)
     end
 
     -- Newly equipped tools
-    character.ChildAdded:Connect(function(item)
+    NHGuard.conn(character.ChildAdded, function(item)
         ConnectTool(item)
     end)
 end
@@ -6932,7 +6574,7 @@ if Players.LocalPlayer.Character then
 end
 
 -- Monitor respawns
-Players.LocalPlayer.CharacterAdded:Connect(function(character)
+NHGuard.conn(Players.LocalPlayer.CharacterAdded, function(character)
     MonitorCharacter(character)
 end)
 
@@ -6963,7 +6605,7 @@ end)
         Callback = function(v) arrestAlertRange = v end;
     })
     local alertClock = 0
-    RunService.Heartbeat:Connect(function(dt)
+    NHGuard.conn(RunService.Heartbeat, function(dt)
         alertClock += dt
         if alertClock < 0.15 then return end
         alertClock = 0
@@ -6991,7 +6633,7 @@ end)
 
         -- PreSimulation (before physics): always moves the real body, never
         -- the UG server pose, so UG cannot erase the movement.
-        local _speedhackconnection = RunService.PreSimulation:Connect(function(delta)
+        local _speedhackconnection = NHGuard.conn(RunService.PreSimulation, function(delta)
             if SpeedhackEnabled then 
                 if not LocalPlayer.Character then 
                     return 
@@ -7225,7 +6867,7 @@ Sections.movement:Toggle({
             -- view, push out for third person. It only runs while the flight camera
             -- is actually active, so it never swallows the scroll wheel on foot.
             local carFlyDistanceSlider
-            UserInputService.InputChanged:Connect(function(input)
+            NHGuard.conn(UserInputService.InputChanged, function(input)
                 if not cameraActive then return end
                 if input.UserInputType ~= Enum.UserInputType.MouseWheel then return end
                 local distance = (CarFly.Distance or 16) - input.Position.Z * 2
@@ -7234,7 +6876,7 @@ Sections.movement:Toggle({
                 if carFlyDistanceSlider then carFlyDistanceSlider:Set(distance) end
             end)
 
-            RunService.Heartbeat:Connect(function(dt)
+            NHGuard.conn(RunService.Heartbeat, function(dt)
                 if not CarFly.Enabled then
                     if bodyVel then stopCarFly() end
                     return
@@ -7422,7 +7064,7 @@ Sections.movement:Toggle({
         local function bindCharacter(model)
             if not model then return end
             if AntiFling.Enabled then stripMovers(model) end
-            model.DescendantAdded:Connect(function(d)
+            NHGuard.conn(model.DescendantAdded, function(d)
                 if not AntiFling.Enabled then return end
                 for _, class in ipairs(MOVER_CLASSES) do
                     if d:IsA(class) then
@@ -7433,7 +7075,7 @@ Sections.movement:Toggle({
             end)
         end
 
-        RunService.Heartbeat:Connect(function()
+        NHGuard.conn(RunService.Heartbeat, function()
             if not AntiFling.Enabled then return end
             local model = LocalPlayer.Character
             local root = model and model:FindFirstChild("HumanoidRootPart")
@@ -7462,7 +7104,7 @@ Sections.movement:Toggle({
         end)
 
         bindCharacter(LocalPlayer.Character)
-        LocalPlayer.CharacterAdded:Connect(bindCharacter)
+        NHGuard.conn(LocalPlayer.CharacterAdded, bindCharacter)
 
         Sections.exploits:Toggle({
             Name = 'anti fling';
@@ -7559,7 +7201,7 @@ Sections.movement:Toggle({
                 task.delay(1, function()
                     if FenceGod.Enabled then sweep() end
                 end)
-                connection = workspace.DescendantAdded:Connect(function(object)
+                connection = NHGuard.conn(workspace.DescendantAdded, function(object)
                     if FenceGod.Enabled and object:IsA("BasePart") then
                         task.defer(function()
                             if FenceGod.Enabled then strip(object) end
@@ -7576,7 +7218,7 @@ Sections.movement:Toggle({
             local humanoid = model:FindFirstChildOfClass("Humanoid")
             if not humanoid then return end
             local last = humanoid.Health
-            humanoid.HealthChanged:Connect(function(health)
+            NHGuard.conn(humanoid.HealthChanged, function(health)
                 if FenceGod.Enabled and health < last then
                     local root = model:FindFirstChild("HumanoidRootPart")
                     if root then
@@ -7594,7 +7236,7 @@ Sections.movement:Toggle({
         end
 
         bindCharacter(LocalPlayer.Character)
-        LocalPlayer.CharacterAdded:Connect(bindCharacter)
+        NHGuard.conn(LocalPlayer.CharacterAdded, bindCharacter)
 
         Sections.exploits:Toggle({
             Name = 'fence godmode';
@@ -7862,10 +7504,10 @@ do
         table.clear(assemblyParts)
         assemblyCharacter, assemblyDirty = character, true
         if character then
-            table.insert(assemblyConns, character.DescendantAdded:Connect(function()
+            table.insert(assemblyConns, NHGuard.conn(character.DescendantAdded, function()
                 assemblyDirty = true
             end))
-            table.insert(assemblyConns, character.DescendantRemoving:Connect(function()
+            table.insert(assemblyConns, NHGuard.conn(character.DescendantRemoving, function()
                 assemblyDirty = true
             end))
         end
@@ -8083,7 +7725,7 @@ do
 
     -- Pause while interacting so pickup distance checks see the real body.
     local mouse = LocalPlayer:GetMouse()
-    add(UserInputService.InputBegan:Connect(function(input, processed)
+    add(NHGuard.conn(UserInputService.InputBegan, function(input, processed)
         if processed then return end
         if input.KeyCode == Enum.KeyCode.E then
             pauseAA(1.25)
@@ -8101,15 +7743,15 @@ do
     end))
 
     local promptService = game:GetService("ProximityPromptService")
-    add(promptService.PromptButtonHoldBegan:Connect(function()
+    add(NHGuard.conn(promptService.PromptButtonHoldBegan, function()
         promptHeld = true
         pauseAA(1.25)
     end))
-    add(promptService.PromptButtonHoldEnded:Connect(function()
+    add(NHGuard.conn(promptService.PromptButtonHoldEnded, function()
         promptHeld = false
         pauseAA(1.25)
     end))
-    add(promptService.PromptTriggered:Connect(function()
+    add(NHGuard.conn(promptService.PromptTriggered, function()
         promptHeld = false
         pauseAA(1.25)
     end))
@@ -8343,14 +7985,6 @@ do
         serverTransform, serverOffset = transform, offset
     end
 
-    -- Server-only root override (used by the invisible peek resolver). While
-    -- set, the server sees the root at this CFrame no matter what UG / pauses
-    -- / the failsafe are doing; the client body and camera stay put.
-    local overrideRoot = nil
-    env.AdvancedAASetOverride = function(cf)
-        if typeof(cf) == "CFrame" then overrideRoot = cf else overrideRoot = nil end
-    end
-
     -- Runs right after physics (PostSimulation) and again after Heartbeat.
     -- The path phase only advances on the first call of the frame so the
     -- movement speed still matches the slider.
@@ -8362,17 +7996,6 @@ do
     function applyServerPoseInner(dt, advance)
         restorePose()
         clearServerPose()
-        if overrideRoot then
-            local character = LocalPlayer.Character
-            local root = character and character:FindFirstChild("HumanoidRootPart")
-            local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-            if root and humanoid and humanoid.Health > 0 then
-                local transform = overrideRoot * root.CFrame:Inverse()
-                applyTransform(character, root, transform,
-                    overrideRoot.Position - root.Position, overrideRoot.Position)
-            end
-            return
-        end
         if not settings.Enabled and not settings.AntiESP then return end
         if promptHeld then return end
         local hideActive = settings.AntiESP
@@ -8391,7 +8014,7 @@ do
 
         -- Shot-pose freeze: hold the exact pose an in-flight shot was built
         -- from until the shot has had time to reach the server and be
-        -- validated. The peek / override paths above still win.
+        -- validated. The peek path above still wins.
         if t < freezeUntil and frozenRootCF then
             local transform = frozenRootCF * root.CFrame:Inverse()
             applyTransform(character, root, transform,
@@ -8479,14 +8102,14 @@ do
     -- post-physics windows are covered; physics itself always simulates the
     -- real pose via the restores below (before the camera AND before the
     -- next step).
-    add(RunService.PostSimulation:Connect(function(dt) applyServerPose(dt, true) end))
-    add(RunService.Heartbeat:Connect(function(dt) applyServerPose(dt, false) end))
+    add(NHGuard.conn(RunService.PostSimulation, function(dt) applyServerPose(dt, true) end))
+    add(NHGuard.conn(RunService.Heartbeat, function(dt) applyServerPose(dt, false) end))
     -- Before the camera and render: real body back, so the client sees and
     -- the camera follows the real pose.
     RunService:BindToRenderStep(renderKey, Enum.RenderPriority.First.Value, restorePose)
     -- Before physics: always simulate the real pose.
-    add(RunService.PreSimulation:Connect(restorePose))
-    add(LocalPlayer.CharacterRemoving:Connect(function()
+    add(NHGuard.conn(RunService.PreSimulation, restorePose))
+    add(NHGuard.conn(LocalPlayer.CharacterRemoving, function()
         restorePose()
         clearServerPose()
         freezeUntil, frozenRootCF = 0, nil
@@ -8505,7 +8128,7 @@ do
             if not value then restorePose(); clearServerPose() end
         end,
     })
-    -- Bridge so other features (and the peek resolver's own toggles) can switch
+    -- Bridge so other features can switch
     -- the displacement on programmatically. This displacement is what actually
     -- makes incoming shots miss - a client-side CanQuery strip cannot.
     env.AdvancedAASetEnabled = function(value)
@@ -8654,8 +8277,6 @@ do
         env.AdvancedAAServerPosition = nil
         env.AdvancedAAUnshiftPosition = nil
         env.AdvancedAAShotState = nil
-        env.AdvancedAASetOverride = nil
-        overrideRoot = nil
         env.AdvancedAAPeek = nil
         env.AdvancedAAIsOrbit = nil
         env.AdvancedAAFeedback = nil
@@ -8663,6 +8284,8 @@ do
         env.AdvancedAASyncWindow = nil
     end
 end
+
+    print("[negrohax] aa ready")
 
 
     --#region hitbox expander
@@ -8713,7 +8336,7 @@ end
             Callback = function(v) HitboxExpander.Color = v end
         })
 
-        RunService.RenderStepped:Connect(function(dt)
+        NHGuard.conn(RunService.RenderStepped, function(dt)
             local follow = 1 - math.exp(-14 * math.clamp(dt or 0.016, 0, 0.1))
             if not (HitboxExpander.Enabled and HitboxExpander.Visual) then
                 if next(hulls) then clearHulls() end
@@ -8991,7 +8614,7 @@ end
 
         -- The camera can be swapped on respawn; drop the model so it is rebuilt
         -- under the new camera (a camera-parented model dies with its parent).
-        workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+        NHGuard.conn(workspace:GetPropertyChangedSignal("CurrentCamera"), function()
             teardown()
             activeTool = nil
             pendingBuild = false
@@ -9121,12 +8744,12 @@ end
         -- nothing can re-show the body after us.
         RunService:BindToRenderStep("ViewModelHideDefault", Enum.RenderPriority.Camera.Value + 1, updateFirstPersonReplace)
         if RunService.PreRender then
-            RunService.PreRender:Connect(updateFirstPersonReplace)
+            NHGuard.conn(RunService.PreRender, updateFirstPersonReplace)
         else
-            RunService.RenderStepped:Connect(updateFirstPersonReplace)
+            NHGuard.conn(RunService.RenderStepped, updateFirstPersonReplace)
         end
 
-        RunService.RenderStepped:Connect(function(dt)
+        NHGuard.conn(RunService.RenderStepped, function(dt)
             local gun = ViewModel.Enabled and equippedGun() or nil
             if gun then
                 lastGunAt = os.clock()
@@ -9224,10 +8847,16 @@ end
         -- drawn at the camera and a tracer from it would hang in the air next to
         -- the character. The muzzle flash is deliberately not drawn here - see
         -- the "remove muzzle flash" feature further down.
-        ViewModelShot = function(hitPoint, fallbackOrigin)
+        --
+        -- `manipOrigin` is the shifted origin when the shot came from origin
+        -- manip: the bullet really starts there, so the tracer starts there too
+        -- and follows the shot the server sees instead of the muzzle.
+        ViewModelShot = function(hitPoint, fallbackOrigin, manipOrigin)
             if not TracerEnabled or typeof(hitPoint) ~= "Vector3" then return end
             local from
-            if isFirstPerson() then
+            if typeof(manipOrigin) == "Vector3" then
+                from = manipOrigin
+            elseif isFirstPerson() then
                 local muzzle = currentMuzzle()
                 if muzzle then from = muzzle.Position end
             end
@@ -9353,7 +8982,7 @@ end
         local function watch(inst, prop, enforce)
             if watched[inst] then return end
             watched[inst] = true
-            inst:GetPropertyChangedSignal(prop):Connect(function()
+            NHGuard.conn(inst:GetPropertyChangedSignal(prop), function()
                 if MuzzleScrub.Enabled then enforce() end
             end)
         end
@@ -9389,7 +9018,7 @@ end
             for _, d in ipairs(tool:GetDescendants()) do scrub(d, isGun) end
             if not watched[tool] then
                 watched[tool] = true
-                tool.DescendantAdded:Connect(function(d) scrub(d, isGun) end)
+                NHGuard.conn(tool.DescendantAdded, function(d) scrub(d, isGun) end)
             end
         end
 
@@ -9404,19 +9033,20 @@ end
 
         local function bindCharacter(character)
             if not character then return end
-            character.ChildAdded:Connect(function(child)
+            NHGuard.conn(character.ChildAdded, function(child)
                 if child:IsA("Tool") then scrubTool(child) end
             end)
         end
 
         bindCharacter(LocalPlayer.Character)
-        LocalPlayer.CharacterAdded:Connect(bindCharacter)
+        NHGuard.conn(LocalPlayer.CharacterAdded, bindCharacter)
 
         -- Fallback re-arm: covers a gun already equipped at load time and any
         -- path that does not raise ChildAdded (for example the tool type
         -- attribute being set a moment after the tool is parented).
         task.spawn(function()
-            while true do
+            local gen = NHGuard.gen
+            while NHGuard.alive(gen) do
                 task.wait(0.5)
                 if MuzzleScrub.Enabled then rearm() end
             end
@@ -9472,7 +9102,7 @@ do
     local function watch(inst, prop, enforce)
         if watched[inst] then return end
         watched[inst] = true
-        inst:GetPropertyChangedSignal(prop):Connect(function()
+        NHGuard.conn(inst:GetPropertyChangedSignal(prop), function()
             if TracerScrub.Enabled then enforce() end
         end)
     end
@@ -9510,7 +9140,7 @@ do
         end
         if enabled then
             sweep()
-            connection = workspace.DescendantAdded:Connect(function(inst)
+            connection = NHGuard.conn(workspace.DescendantAdded, function(inst)
                 if TracerScrub.Enabled then scrub(inst) end
             end)
         end
@@ -9680,13 +9310,13 @@ do
         task.spawn(function()
             local humanoid = character:WaitForChild("Humanoid", 10)
             if not humanoid then return end
-            humanoid.Died:Connect(function()
+            NHGuard.conn(humanoid.Died, function()
                 if KillFeed.Enabled then push("You died", Color3.fromRGB(255, 255, 255)) end
             end)
         end)
     end
     watchSelf(LocalPlayer.Character)
-    LocalPlayer.CharacterAdded:Connect(watchSelf)
+    NHGuard.conn(LocalPlayer.CharacterAdded, watchSelf)
 
     Sections.hit:Toggle({
         Name = 'kill feed';
@@ -9718,3 +9348,5 @@ end
 
 
 Window:InitWindow()
+
+print("[negrohax] loaded")
