@@ -424,6 +424,17 @@
 --#endregion
 
 
+-- Tween zoom state. Kept at the top level so the hotkey / sliders (misc tab)
+-- and the FOV render loop (visuals tab) can all share it. The bound key eases
+-- the camera FOV to ZoomFov while held, then back to the FOV captured on
+-- key-down, so it works with or without the FOV changer.
+local ZoomHeld = false
+local ZoomActive = false
+local ZoomFov = 55
+local ZoomSpeed = 12
+local ZoomReturnFov = nil
+
+
 -- Shared team policy for aim, ESP and chams. Unknown teams fall back to
 -- same-team exclusion instead of guessing their role.
 local CurrentTargetPlayer, CurrentTargetTime = nil, 0
@@ -774,7 +785,8 @@ local function AAIgnoreList()
     for _, obj in ipairs(workspace:GetChildren()) do
         local name = obj.Name
         if name == "AdvancedAALocalVisual" or name == "WallPenFX"
-            or name == "HitboxExpanderHulls" or name == "LatencyGhost" then
+            or name == "HitboxExpanderHulls" or name == "LatencyGhost"
+            or name == "CustomBody" then
             count = count + 1
             ignoreList[count] = obj
         end
@@ -3019,6 +3031,18 @@ do -- combat
                 ManipEnabled = v;
             end
         })
+
+        -- Origin manip hotkey: M by default, listed in the "hotkeys" panel.
+        Sections.aimbot:Label({Name = 'manip key'}):Keybind({
+            Name = 'manip key';
+            Flag = 'manipkey';
+            Mode = 'Toggle';
+            Default = Enum.KeyCode.M;
+            ShowInList = true;
+            Callback = function(v)
+                ManipEnabled = v;
+            end
+        })
         
         Sections.aimbot:Slider({
             Name = "manip dist";
@@ -3057,6 +3081,17 @@ do -- combat
         Sections.aimbot:Toggle({
             Name = "wallpen"; Flag = "wallpen"; Default = false;
             Callback = function(v) WallPen.Enabled = v end;
+        })
+        -- Wallpen hotkey: B (wallbang) by default, listed in the "hotkeys" panel.
+        Sections.aimbot:Label({Name = 'wallpen key'}):Keybind({
+            Name = 'wallpen key';
+            Flag = 'wallpenkey';
+            Mode = 'Toggle';
+            Default = Enum.KeyCode.B;
+            ShowInList = true;
+            Callback = function(v)
+                WallPen.Enabled = v;
+            end
         })
         -- Vehicle wallbang: cars stop counting as cover, so the aim can shoot
         -- straight through them at whoever is behind or inside. Works with
@@ -3112,6 +3147,20 @@ do -- combat
                 RageBotEnabled = v;
                 AimState.Ragebot = v;
             end 
+        })
+
+        -- Ragebot hotkey: R by default, listed in the "hotkeys" panel. Keeps
+        -- the aim state in sync just like the switch does.
+        Sections.aimbot:Label({Name = 'ragebot key'}):Keybind({
+            Name = 'ragebot key';
+            Flag = 'ragebotkey';
+            Mode = 'Toggle';
+            Default = Enum.KeyCode.R;
+            ShowInList = true;
+            Callback = function(v)
+                RageBotEnabled = v;
+                AimState.Ragebot = v;
+            end
         })
 
         do -- player filter
@@ -3342,6 +3391,9 @@ do -- combat
         local Tracker = {
             Enabled = false,
             Color = Color3.fromRGB(255, 255, 255),
+            Rainbow = false,
+            RainbowSpeed = 0.5,    -- hue cycles per second
+            Spin = 0,              -- degrees per second; 0 = no spin
             Thickness = 1.5,
             Size = 12,
             Shape = "Crosshair",   -- Crosshair | Star of David | Polygon
@@ -3402,6 +3454,7 @@ do -- combat
 
         local segments = buildSegments()
         local dirty = false
+        local spinAngle = 0
 
         local function hideAll()
             if Tracker.Has then
@@ -3416,6 +3469,13 @@ do -- combat
             if not Tracker.Enabled then
                 hideAll()
                 return
+            end
+            if Tracker.Rainbow then
+                -- Full saturation / value, like the FOV rainbow. The default
+                -- tracker colour is white (saturation 0), so cycling only its
+                -- hue would stay grey and look like the rainbow never ran.
+                local h = Tracker.Color:ToHSV()
+                Tracker.Color = Color3.fromHSV((h + dt * Tracker.RainbowSpeed) % 1, 1, 1)
             end
             if dirty then
                 segments = buildSegments()
@@ -3445,14 +3505,20 @@ do -- combat
                 Tracker.Y += (ty - Tracker.Y) * k
             end
 
+            -- Spin the unit-space shape around its own centre. 0 = static.
+            spinAngle = (spinAngle + (dt or 0.016) * Tracker.Spin) % 360
+            local cs, sn = math.cos(math.rad(spinAngle)), math.sin(math.rad(spinAngle))
+
             local cx, cy = Tracker.X, Tracker.Y
             local size = Tracker.Size
             for i = 1, MAX_SEGMENTS do
                 local l = segs[i]
                 local seg = segments[i]
                 if seg then
-                    l.From = Vector2.new(cx + seg[1].X * size, cy + seg[1].Y * size)
-                    l.To = Vector2.new(cx + seg[2].X * size, cy + seg[2].Y * size)
+                    local ax, ay = seg[1].X, seg[1].Y
+                    local bx, by = seg[2].X, seg[2].Y
+                    l.From = Vector2.new(cx + (ax * cs - ay * sn) * size, cy + (ax * sn + ay * cs) * size)
+                    l.To = Vector2.new(cx + (bx * cs - by * sn) * size, cy + (bx * sn + by * cs) * size)
                     l.Color = Tracker.Color
                     l.Thickness = Tracker.Thickness
                     l.Transparency = 1
@@ -3504,6 +3570,27 @@ do -- combat
             Flag = 'trackercolor';
             Default = Tracker.Color;
             Callback = function(v) Tracker.Color = v end
+        })
+
+        Sections.visuals:Toggle({
+            Name = 'tracker rainbow';
+            Flag = 'trackerrainbow';
+            Default = false;
+            Callback = function(v) Tracker.Rainbow = v end
+        })
+
+        Sections.visuals:Slider({
+            Name = 'tracker rainbow speed';
+            Flag = 'trackerrainbowspeed';
+            Min = 0.05; Max = 3; Default = 0.5; Decimals = 0.05;
+            Callback = function(v) Tracker.RainbowSpeed = v end
+        })
+
+        Sections.visuals:Slider({
+            Name = 'tracker spin (deg/s)';
+            Flag = 'trackerspin';
+            Min = 0; Max = 720; Default = 0; Decimals = 1;
+            Callback = function(v) Tracker.Spin = v end
         })
 
         Sections.visuals:Slider({
@@ -4926,7 +5013,7 @@ end -- movement resolver
 
     --#region calm luh logic brader
 
-        RunService.RenderStepped:Connect(function()
+        RunService.RenderStepped:Connect(function(dt)
             if FullbrightEnabled then
                 -- Guarded: writing the same value every frame still fires
                 -- property-changed signals all over the lighting system.
@@ -4950,7 +5037,24 @@ end -- movement resolver
                     atmo.Density = 0 
                 end
             end
-            if FovChanger and Camera.FieldOfView ~= Fov then
+            if ZoomActive or ZoomHeld then
+                -- Tween toward ZoomFov while the hotkey is held, then ease back
+                -- to the captured FOV on release. Exponential easing is
+                -- frame-rate independent, so the zoom is smooth at any FPS.
+                local target = ZoomHeld and ZoomFov or (ZoomReturnFov or Fov)
+                local cur = Camera.FieldOfView
+                local nextFov = cur + (target - cur) * math.min(1, ZoomSpeed * (dt or 0.016))
+                if math.abs(target - nextFov) < 0.05 then
+                    nextFov = target
+                    if not ZoomHeld then
+                        ZoomActive = false
+                        ZoomReturnFov = nil
+                    end
+                end
+                if Camera.FieldOfView ~= nextFov then
+                    Camera.FieldOfView = nextFov
+                end
+            elseif FovChanger and Camera.FieldOfView ~= Fov then
                 Camera.FieldOfView = Fov
             end
         end)
@@ -4968,6 +5072,9 @@ end -- movement resolver
             end
         end)
         Camera:GetPropertyChangedSignal("FieldOfView"):Connect(function() 
+            -- Don't let the FOV changer snap back while the zoom tween is
+            -- driving the FOV, otherwise it fights the animation every frame.
+            if ZoomActive or ZoomHeld then return end
             if FovChanger and Camera.FieldOfView ~= Fov then 
                 Camera.FieldOfView = Fov
             end
@@ -6609,6 +6716,19 @@ end)
             end 
         })
 
+        -- Speed hack hotkey: X by default, listed in the in-game "hotkeys"
+        -- panel and rebindable there. Toggles the same state as the switch.
+        Sections.movement:Label({Name = 'speed hack key'}):Keybind({
+            Name = 'speed hack key';
+            Flag = 'speedhackkey';
+            Mode = 'Toggle';
+            Default = Enum.KeyCode.X;
+            ShowInList = true;
+            Callback = function(v)
+                SpeedhackEnabled = v;
+            end
+        })
+
         Sections.movement:Slider({
             Name = 'speed';
             Flag = 'speed';
@@ -6971,6 +7091,54 @@ Sections.movement:Toggle({
                 Decimals = 10;
                 Callback = function(v)
                     CarFly.SpinSpeed = v
+                end
+            })
+
+            -- Tween zoom: hold the bound key (Z by default) to smoothly ease
+            -- the camera FOV in, release to ease back out. Registered as a
+            -- library keybind so it is listed in the in-game "hotkeys" panel
+            -- and can be rebound there.
+            Sections.movement:Label({Name = 'tween zoom'}):Keybind({
+                Name = 'tween zoom';
+                Flag = 'tweenzoom';
+                Mode = 'Hold';
+                Default = Enum.KeyCode.Z;
+                ShowInList = true;
+                Callback = function(v)
+                    if v then
+                        if not ZoomHeld then
+                            ZoomReturnFov = Camera.FieldOfView
+                        end
+                        ZoomHeld = true
+                        ZoomActive = true
+                    else
+                        ZoomHeld = false
+                        -- ZoomActive stays on until the return tween finishes.
+                    end
+                end
+            })
+
+            Sections.movement:Slider({
+                Name = 'tween zoom fov';
+                Flag = 'tweenzoomfov';
+                Max = 110;
+                Min = 1;
+                Default = 55;
+                Decimals = 1;
+                Callback = function(v)
+                    ZoomFov = v;
+                end
+            })
+
+            Sections.movement:Slider({
+                Name = 'tween zoom speed';
+                Flag = 'tweenzoomspeed';
+                Max = 40;
+                Min = 1;
+                Default = 12;
+                Decimals = 1;
+                Callback = function(v)
+                    ZoomSpeed = v;
                 end
             })
         end
@@ -7429,6 +7597,14 @@ do
         -- cycle/s the mismatch is under a stud, while the shape still reads
         -- clearly on the ghost.
         Speed = 1,
+        -- Spinbot: rotate the SERVER pose around the root every frame. The
+        -- client body stays still (the real pose is restored before render),
+        -- but the server holds a spinning character so incoming aim cannot
+        -- settle on a facing. Shot origins use serverTransform, so our own
+        -- shots still line up with whatever angle the server holds. The angle
+        -- is driven from wall-clock time so even very slow speeds stay smooth.
+        Spinbot = false,
+        SpinSpeed = 90, -- degrees per second (as low as 1 for a slow, smooth turn)
     }
 
     -- Real pose saved at Heartbeat, written back before render / physics.
@@ -7474,6 +7650,14 @@ do
     end
 
     local phase = 0
+    local spinAngle = 0
+    -- Client-visible spin. The server pose is put back before the camera, so
+    -- to SEE the spin we re-apply a pure rotation around the root only for the
+    -- rendered frame (after the camera) and put the real pose back before
+    -- physics. The camera therefore never moves or rotates from it.
+    local clientSpinSaved = {}
+    local clientSpinApplied = false
+    local clientSpinKey = "AdvancedAA_ClientSpin_" .. tostring(LocalPlayer.UserId)
     local pausedUntil = 0
     local forceSyncUntil = 0
     local promptHeld = false
@@ -7557,6 +7741,49 @@ do
 
     local function clearServerPose()
         serverTransform, serverOffset = nil, Vector3.zero
+    end
+
+    -- Advance the spin from wall-clock time straight inside the render step,
+    -- so every rendered frame gets exactly one update - no Heartbeat /
+    -- RenderStepped phase drift causing frames with 0 or 2 updates (the
+    -- "see-saw" speed pulse). The spin is still visual only: it is undone
+    -- before physics and the camera has already been positioned.
+    local lastSpinTime = os.clock()
+    local function applyClientSpin()
+        local t = os.clock()
+        local dt = t - lastSpinTime
+        lastSpinTime = t
+
+        if not settings.Spinbot then return end
+        if dt > 0 then
+            spinAngle = (spinAngle + math.min(dt, 0.5) * math.rad(settings.SpinSpeed))
+                % (math.pi * 2)
+        end
+
+        local character = LocalPlayer.Character
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        if not root then return end
+        local pivot = root.Position
+        local spinCF = CFrame.new(pivot) * CFrame.Angles(0, spinAngle, 0) * CFrame.new(-pivot)
+        table.clear(clientSpinSaved)
+        for _, part in ipairs(AssemblyParts(character)) do
+            clientSpinSaved[part] = part.CFrame
+            pcall(function() part.CFrame = spinCF * part.CFrame end)
+        end
+        clientSpinApplied = true
+    end
+
+    -- Undo the visual spin before physics so it never reaches movement,
+    -- collision or the server pose. The real body is always what simulates.
+    local function restoreClientSpin()
+        if not clientSpinApplied then return end
+        clientSpinApplied = false
+        for part, cf in pairs(clientSpinSaved) do
+            if part.Parent then
+                pcall(function() part.CFrame = cf end)
+            end
+        end
+        table.clear(clientSpinSaved)
     end
 
     local function pauseAA(seconds)
@@ -8039,14 +8266,14 @@ do
         -- positive depths were rejected while negative (upward) ones worked.
         if destination.Y < workspace.FallenPartsDestroyHeight + 2 then return end
 
-        -- Rotation (UG horizontal only): roll -90 degrees around the
-        -- character's own facing direction -> lies flat, right side up.
-        local rotation = CFrame.new()
+        -- Spinbot yaw + UG horizontal roll, both around the root pivot. The
+        -- identity case is unchanged when neither feature is on.
+        local rotation = settings.Spinbot and CFrame.Angles(0, spinAngle, 0) or CFrame.new()
         if settings.Underground and settings.HorizontalUG then
             local look = root.CFrame.LookVector
             look = Vector3.new(look.X, 0, look.Z)
             if look.Magnitude > 0.01 then
-                rotation = CFrame.fromAxisAngle(look.Unit, -math.pi / 2)
+                rotation = rotation * CFrame.fromAxisAngle(look.Unit, -math.pi / 2)
             end
         end
         -- Rotate around the root, then move straight down by the offset.
@@ -8066,9 +8293,16 @@ do
     -- Before the camera and render: real body back, so the client sees and
     -- the camera follows the real pose.
     RunService:BindToRenderStep(renderKey, Enum.RenderPriority.First.Value, restorePose)
-    -- Before physics: always simulate the real pose.
-    add(RunService.PreSimulation:Connect(restorePose))
+    -- After the camera: re-apply the spin only for the rendered frame. The
+    -- camera is already positioned from the real pose, so the spin never
+    -- moves or affects it. The custom body mesh (Camera + 2) then reads the
+    -- spun root, so the visible avatar spins too.
+    RunService:BindToRenderStep(clientSpinKey, Enum.RenderPriority.Camera.Value + 1, applyClientSpin)
+    -- Before physics: always simulate the real pose. Undo the visual spin
+    -- first so it never reaches movement / collision / the server pose.
+    add(RunService.PreSimulation:Connect(function() restorePose(); restoreClientSpin() end))
     add(LocalPlayer.CharacterRemoving:Connect(function()
+        restoreClientSpin()
         restorePose()
         clearServerPose()
         freezeUntil, frozenRootCF = 0, nil
@@ -8209,14 +8443,24 @@ do
         Min = 0.25, Max = 20, Default = 1, Decimals = 0.25,
         Callback = function(value) settings.Speed = value end,
     })
+    section:Toggle({ Name = "spinbot (server-side spin)", Flag = "advanced_aa_spinbot",
+        Default = false,
+        Callback = function(value) settings.Spinbot = value end })
+    section:Slider({ Name = "spinbot speed (deg/s)", Flag = "advanced_aa_spin_speed",
+        Min = 1, Max = 1800, Default = 90, Decimals = 1,
+        Callback = function(value) settings.SpinSpeed = value end })
 
     env.AdvancedAACleanup = function()
         settings.Enabled = false
         settings.AutoDepth = false
+        settings.Spinbot = false
+        spinAngle = 0
+        restoreClientSpin()
         restorePose()
         clearServerPose()
         freezeUntil, frozenRootCF = 0, nil
         pcall(function() RunService:UnbindFromRenderStep(renderKey) end)
+        pcall(function() RunService:UnbindFromRenderStep(clientSpinKey) end)
         for _, connection in ipairs(connections) do
             pcall(function() connection:Disconnect() end)
         end
@@ -8243,6 +8487,115 @@ do
         env.AdvancedAASyncWindow = nil
     end
 end
+
+
+    --#region custom body
+    -- Client-only avatar replacement using the tung-tung character mesh. The
+    -- MeshPart is created on our client, follows the REAL root every frame and
+    -- is never replicated. The real body parts are hidden with
+    -- LocalTransparencyModifier (also client-only), so the server still sees
+    -- whatever pose the anti-aim holds - it just never sees this mesh.
+    do
+        local CustomBody = {
+            Enabled = false,
+            -- The mesh already faces forward (Roblox -Z) and the root CFrame
+            -- carries the direction we look, so no base offset is needed. A
+            -- 90deg default used to turn it sideways (facing left).
+            Yaw = 0,
+            Size = 4,
+        }
+        local mesh
+        local hidden = {}
+        local boundCharacter
+
+        -- Remember each thing's original value so disabling restores exactly
+        -- what was there (chams / other features may have touched it).
+        local function restoreBody()
+            for obj, old in pairs(hidden) do
+                if obj.Parent then
+                    if obj:IsA("BasePart") then
+                        obj.LocalTransparencyModifier = old
+                    elseif obj:IsA("BillboardGui") or obj:IsA("SurfaceGui") then
+                        obj.Enabled = old
+                    end
+                end
+                hidden[obj] = nil
+            end
+        end
+
+        local function update()
+            local character = LocalPlayer.Character
+            local root = character and character:FindFirstChild("HumanoidRootPart")
+            if not CustomBody.Enabled or not character or not root then
+                if mesh and mesh.Parent then mesh.Parent = nil end
+                restoreBody()
+                return
+            end
+            if character ~= boundCharacter then
+                restoreBody()
+                boundCharacter = character
+            end
+            if not mesh then
+                mesh = Instance.new("MeshPart")
+                mesh.Name = "CustomBody"
+                mesh.MeshId = "rbxassetid://82464974337955"
+                mesh.TextureID = "rbxassetid://105445253181063"
+                mesh.Anchored = true
+                mesh.CanCollide = false
+                mesh.CanQuery = false
+                mesh.CanTouch = false
+                mesh.CastShadow = false
+                mesh:SetAttribute("NegrohaxCustomBody", true)
+            end
+            mesh.Size = Vector3.new(CustomBody.Size, CustomBody.Size, CustomBody.Size)
+            mesh.CFrame = root.CFrame * CFrame.Angles(0, math.rad(CustomBody.Yaw), 0)
+            if mesh.Parent ~= workspace then mesh.Parent = workspace end
+            -- Hide the ENTIRE original avatar, not just a fixed list: every
+            -- BasePart (arms, legs, head, torso, accessories, hats, held tools,
+            -- anything added later) plus floating name / billboard guis. This
+            -- is all client-side via LocalTransparencyModifier, so the server
+            -- still sees the real / anti-aim pose and nothing replicates.
+            for _, obj in ipairs(character:GetDescendants()) do
+                if obj:IsA("BasePart") then
+                    if hidden[obj] == nil then hidden[obj] = obj.LocalTransparencyModifier end
+                    if obj.LocalTransparencyModifier ~= 1 then
+                        obj.LocalTransparencyModifier = 1
+                    end
+                elseif obj:IsA("BillboardGui") or obj:IsA("SurfaceGui") then
+                    if hidden[obj] == nil then hidden[obj] = obj.Enabled end
+                    if obj.Enabled then obj.Enabled = false end
+                end
+            end
+        end
+
+        -- Run after the view model's body-hide step so our hiding wins, and
+        -- again on the last pre-render event so nothing shows it again.
+        RunService:BindToRenderStep("CustomBody", Enum.RenderPriority.Camera.Value + 2, update)
+        if RunService.PreRender then
+            RunService.PreRender:Connect(update)
+        end
+        LocalPlayer.CharacterRemoving:Connect(function()
+            restoreBody()
+            boundCharacter = nil
+            if mesh and mesh.Parent then mesh.Parent = nil end
+        end)
+
+        Sections.visuals:Toggle({
+            Name = "custom body"; Flag = "custombody"; Default = false;
+            Callback = function(v) CustomBody.Enabled = v; update() end
+        })
+        Sections.visuals:Slider({
+            Name = "custom body yaw"; Flag = "custombodyyaw";
+            Min = 0; Max = 360; Default = 0; Decimals = 1;
+            Callback = function(v) CustomBody.Yaw = v end
+        })
+        Sections.visuals:Slider({
+            Name = "custom body size"; Flag = "custombodysize";
+            Min = 1; Max = 10; Default = 4; Decimals = 0.1;
+            Callback = function(v) CustomBody.Size = v end
+        })
+    end
+    --#endregion
 
 
     --#region hitbox expander
