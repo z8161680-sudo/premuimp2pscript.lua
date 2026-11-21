@@ -8490,23 +8490,90 @@ end
 
 
     --#region custom body
-    -- Client-only avatar replacement using the tung-tung character mesh. The
-    -- MeshPart is created on our client, follows the REAL root every frame and
-    -- is never replicated. The real body parts are hidden with
-    -- LocalTransparencyModifier (also client-only), so the server still sees
-    -- whatever pose the anti-aim holds - it just never sees this mesh.
+    -- Client-only avatar replacement. The model is created on our client,
+    -- follows the REAL root every frame and is never replicated. The real body
+    -- parts are hidden with LocalTransparencyModifier (also client-only), so
+    -- the server still sees whatever pose the anti-aim holds - it just never
+    -- sees this mesh.
+    --
+    -- Presets hold raw mesh / texture IDs. "MeshPart" is the modern path used
+    -- by the original model; "FileMesh" is the Part + SpecialMesh path used by
+    -- older mesh uploads (amogus / dababy / spongebob).
     do
+        local BodyPresets = {
+            ["tung tung"] = { kind = "MeshPart", mesh = "82464974337955", texture = "105445253181063" },
+            ["amogus"]    = { kind = "FileMesh", mesh = "6779025456",     texture = "6779025490" },
+            ["dababy"]    = { kind = "FileMesh", mesh = "6620613568",     texture = "6620614695" },
+            ["spongebob"] = { kind = "FileMesh", mesh = "208655360",      texture = "208655409" },
+            ["custom"]    = { kind = "FileMesh", mesh = nil,              texture = nil },
+        }
         local CustomBody = {
             Enabled = false,
+            Preset = "tung tung",
+            Kind = "MeshPart",
+            MeshId = "82464974337955",
+            TextureId = "105445253181063",
             -- The mesh already faces forward (Roblox -Z) and the root CFrame
             -- carries the direction we look, so no base offset is needed. A
             -- 90deg default used to turn it sideways (facing left).
             Yaw = 0,
             Size = 4,
+            OffsetY = 0,
         }
-        local mesh
+        local mesh, meshVisual, meshKey
         local hidden = {}
         local boundCharacter
+        local syncingUI = false
+
+        local function idOf(value)
+            return tostring(value or ""):match("%d+") or ""
+        end
+        local function contentKey()
+            return CustomBody.Kind .. "|" .. idOf(CustomBody.MeshId)
+                .. "|" .. idOf(CustomBody.TextureId)
+        end
+
+        -- Rebuild only when the model or either ID actually changes. Both
+        -- branches produce a workspace child literally named "CustomBody" so
+        -- AAIgnoreList() keeps raycasts off it.
+        local function buildBody()
+            if mesh then mesh:Destroy() end
+            mesh, meshVisual = nil, nil
+            local mid, tid = idOf(CustomBody.MeshId), idOf(CustomBody.TextureId)
+            local meshContent = mid ~= "" and ("rbxassetid://" .. mid) or ""
+            local textureContent = tid ~= "" and ("rbxassetid://" .. tid) or ""
+            if CustomBody.Kind == "MeshPart" then
+                local part = Instance.new("MeshPart")
+                part.Name = "CustomBody"
+                part.MeshId = meshContent
+                part.TextureID = textureContent
+                part.Anchored = true
+                part.CanCollide = false
+                part.CanQuery = false
+                part.CanTouch = false
+                part.CastShadow = false
+                part:SetAttribute("NegrohaxCustomBody", true)
+                mesh, meshVisual = part, part
+            else
+                local part = Instance.new("Part")
+                part.Name = "CustomBody"
+                part.Size = Vector3.new(1, 1, 1)
+                part.Anchored = true
+                part.CanCollide = false
+                part.CanQuery = false
+                part.CanTouch = false
+                part.CastShadow = false
+                part.Transparency = 0
+                part:SetAttribute("NegrohaxCustomBody", true)
+                local visual = Instance.new("SpecialMesh")
+                visual.MeshType = Enum.MeshType.FileMesh
+                visual.MeshId = meshContent
+                visual.TextureId = textureContent
+                visual.Parent = part
+                mesh, meshVisual = part, visual
+            end
+            meshKey = contentKey()
+        end
 
         -- Remember each thing's original value so disabling restores exactly
         -- what was there (chams / other features may have touched it).
@@ -8535,20 +8602,14 @@ end
                 restoreBody()
                 boundCharacter = character
             end
-            if not mesh then
-                mesh = Instance.new("MeshPart")
-                mesh.Name = "CustomBody"
-                mesh.MeshId = "rbxassetid://82464974337955"
-                mesh.TextureID = "rbxassetid://105445253181063"
-                mesh.Anchored = true
-                mesh.CanCollide = false
-                mesh.CanQuery = false
-                mesh.CanTouch = false
-                mesh.CastShadow = false
-                mesh:SetAttribute("NegrohaxCustomBody", true)
+            if not mesh or meshKey ~= contentKey() then buildBody() end
+            if meshVisual:IsA("MeshPart") then
+                meshVisual.Size = Vector3.new(CustomBody.Size, CustomBody.Size, CustomBody.Size)
+            else
+                meshVisual.Scale = Vector3.new(CustomBody.Size, CustomBody.Size, CustomBody.Size)
             end
-            mesh.Size = Vector3.new(CustomBody.Size, CustomBody.Size, CustomBody.Size)
-            mesh.CFrame = root.CFrame * CFrame.Angles(0, math.rad(CustomBody.Yaw), 0)
+            mesh.CFrame = (root.CFrame * CFrame.Angles(0, math.rad(CustomBody.Yaw), 0))
+                + Vector3.new(0, CustomBody.OffsetY, 0)
             if mesh.Parent ~= workspace then mesh.Parent = workspace end
             -- Hide the ENTIRE original avatar, not just a fixed list: every
             -- BasePart (arms, legs, head, torso, accessories, hats, held tools,
@@ -8577,13 +8638,77 @@ end
         LocalPlayer.CharacterRemoving:Connect(function()
             restoreBody()
             boundCharacter = nil
-            if mesh and mesh.Parent then mesh.Parent = nil end
+            if mesh then mesh:Destroy() end
+            mesh, meshVisual, meshKey = nil, nil, nil
         end)
+
+        local modelDrop, kindDrop, meshBox, textureBox
 
         Sections.visuals:Toggle({
             Name = "custom body"; Flag = "custombody"; Default = false;
             Callback = function(v) CustomBody.Enabled = v; update() end
         })
+        modelDrop = Sections.visuals:Dropdown({
+            Name = "body model"; Flag = "custombodymodel";
+            Items = { "tung tung", "amogus", "dababy", "spongebob", "custom" };
+            Default = "tung tung";
+            Callback = function(v)
+                if syncingUI then return end
+                local preset = BodyPresets[v]
+                if not preset then return end
+                CustomBody.Preset = v
+                if v == "custom" then return end
+                CustomBody.Kind = preset.kind
+                CustomBody.MeshId = preset.mesh
+                CustomBody.TextureId = preset.texture
+                syncingUI = true
+                if kindDrop then kindDrop:Set(preset.kind) end
+                if meshBox then meshBox:Set(preset.mesh) end
+                if textureBox then textureBox:Set(preset.texture) end
+                syncingUI = false
+                update()
+            end
+        })
+        kindDrop = Sections.visuals:Dropdown({
+            Name = "body mesh type"; Flag = "custombodykind";
+            Items = { "MeshPart", "FileMesh" };
+            Default = "MeshPart";
+            Callback = function(v)
+                if syncingUI then return end
+                CustomBody.Kind = v
+                update()
+            end
+        })
+        -- The library fires each textbox callback while it is being created;
+        -- suppress that so the defaults do not flip the preset to "custom".
+        syncingUI = true
+        meshBox = Sections.visuals:Textbox({
+            Name = "body mesh id"; Flag = "custombodymeshid";
+            Default = "82464974337955";
+            Placeholder = "mesh asset id";
+            Callback = function(v)
+                if syncingUI then return end
+                CustomBody.MeshId = v
+                CustomBody.Preset = "custom"
+                syncingUI = true
+                if modelDrop.Value ~= "custom" then modelDrop:Set("custom") end
+                syncingUI = false
+            end
+        })
+        textureBox = Sections.visuals:Textbox({
+            Name = "body texture id"; Flag = "custombodytextureid";
+            Default = "105445253181063";
+            Placeholder = "texture asset id";
+            Callback = function(v)
+                if syncingUI then return end
+                CustomBody.TextureId = v
+                CustomBody.Preset = "custom"
+                syncingUI = true
+                if modelDrop.Value ~= "custom" then modelDrop:Set("custom") end
+                syncingUI = false
+            end
+        })
+        syncingUI = false
         Sections.visuals:Slider({
             Name = "custom body yaw"; Flag = "custombodyyaw";
             Min = 0; Max = 360; Default = 0; Decimals = 1;
@@ -8593,6 +8718,11 @@ end
             Name = "custom body size"; Flag = "custombodysize";
             Min = 1; Max = 10; Default = 4; Decimals = 0.1;
             Callback = function(v) CustomBody.Size = v end
+        })
+        Sections.visuals:Slider({
+            Name = "custom body offset y"; Flag = "custombodyoffsety";
+            Min = -4; Max = 4; Default = 0; Decimals = 0.1;
+            Callback = function(v) CustomBody.OffsetY = v end
         })
     end
     --#endregion
